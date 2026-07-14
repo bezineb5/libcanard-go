@@ -22,3 +22,7 @@ vendor/
 .idea/
 .vscode/
 .DS_Store
+
+# Upstream C reference implementation (kept on disk, not tracked)
+/libcanard/
+/tests/
