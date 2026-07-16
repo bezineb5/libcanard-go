@@ -84,7 +84,7 @@ func (self *Canard) Poll(txReadyIfaceBitmap uint8) {
 		}
 	}
 	self.txExpire(self.VTable.Now(self))
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		if (txReadyIfaceBitmap & (1 << uint(i))) != 0 {
 			self.txEjectPending(uint8(i))
 		}

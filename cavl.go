@@ -224,7 +224,11 @@ func cavlRebalanceDelete(t **cavlNode, n *cavlNode) {
 func cavlFind(root **cavlNode, key *cavlNode, cmp func(*cavlNode, *cavlNode) int32) *cavlNode {
 	p := *root
 	for p != nil {
-		dir := branch(cmp(key, p))
+		c := cmp(key, p)
+		if c == 0 {
+			return p
+		}
+		dir := branch(c)
 		if p.lr[dir] == nil {
 			break
 		}
@@ -248,7 +252,11 @@ func cavlFindOrInsert(t **cavlNode, key *cavlNode, cmp func(*cavlNode, *cavlNode
 	p := *t
 	for p != nil {
 		parent = p
-		dir := branch(cmp(key, p))
+		c := cmp(key, p)
+		if c == 0 {
+			return p
+		}
+		dir := branch(c)
 		if p.lr[dir] == nil {
 			break
 		}

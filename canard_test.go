@@ -34,7 +34,7 @@ func checkAVL(t *testing.T, root *cavlNode) {
 func TestAVLInsert(t *testing.T) {
 	owners := map[int]*cavlNode{}
 	var root *cavlNode
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		node := &cavlNode{owner: i}
 		owners[i] = node
 		cavlFindOrInsert(&root, &cavlNode{owner: i}, func(a, b *cavlNode) int32 {

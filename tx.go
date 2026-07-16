@@ -8,7 +8,7 @@ var frameRegistry = map[unsafe.Pointer]*txFrame{}
 
 // txFrame is a single CAN frame in the TX spool. Frames are chained to form a multi-frame transfer.
 type txFrame struct {
-	size    int
+	size     int
 	next     *txFrame
 	refcount uint32
 	dlc      uint8
@@ -36,7 +36,7 @@ func txFrameNew(self *Canard, dataSize int) *txFrame {
 	data := make([]byte, dataSize)
 	f := &txFrame{
 		refcount: 1,
-		size:    dataSize,
+		size:     dataSize,
 		dlc:      LenToDlc[dataSize],
 		data:     data,
 	}
@@ -247,17 +247,17 @@ func crcAddChain(crc uint16, payload []byte) uint16 {
 
 // txTransfer is the reassembly/transmission descriptor for a whole transfer (possibly multi-frame).
 type txTransfer struct {
-	indexPending    [IfaceCount]cavlNode
-	indexDeadline   cavlNode
-	listAgewise     cavlListed
-	userContext     any
-	deadline        int64
-	seqno           uint64
-	canIDMSB        uint32
-	fd              bool
-	multiFrame      bool
+	indexPending       [IfaceCount]cavlNode
+	indexDeadline      cavlNode
+	listAgewise        cavlListed
+	userContext        any
+	deadline           int64
+	seqno              uint64
+	canIDMSB           uint32
+	fd                 bool
+	multiFrame         bool
 	firstFrameDeparted bool
-	cursor          [IfaceCount]*txFrame
+	cursor             [IfaceCount]*txFrame
 }
 
 func txTransferNew(self *Canard, deadline int64, canIDTemplate uint32, fd bool, userContext any) *txTransfer {
@@ -269,7 +269,7 @@ func txTransferNew(self *Canard, deadline int64, canIDTemplate uint32, fd bool, 
 		fd:          fd,
 	}
 	self.tx.seqno++
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		tr.indexPending[i].owner = tr
 	}
 	tr.indexDeadline.owner = tr
@@ -308,7 +308,7 @@ func txCompareDeadline(a, b *cavlNode) int32 {
 }
 
 func txIsPending(self *Canard, tr *txTransfer) bool {
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		if cavlIsInserted(&tr.indexPending[i]) {
 			return true
 		}
@@ -317,7 +317,7 @@ func txIsPending(self *Canard, tr *txTransfer) bool {
 }
 
 func (self *Canard) txFreePayload(tr *txTransfer) {
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		frame := tr.cursor[i]
 		for frame != nil {
 			next := frame.next
@@ -329,7 +329,7 @@ func (self *Canard) txFreePayload(tr *txTransfer) {
 }
 
 func (self *Canard) txRetire(tr *txTransfer) {
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		cavlRemoveIf(&self.tx.pending[i], &tr.indexPending[i])
 	}
 	cavlRemove(&self.tx.deadline, &tr.indexDeadline)
@@ -338,7 +338,7 @@ func (self *Canard) txRetire(tr *txTransfer) {
 }
 
 func (self *Canard) txMakePending(tr *txTransfer) {
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		if (tr.cursor[i] != nil) && !cavlIsInserted(&tr.indexPending[i]) {
 			cavlFindOrInsert(&self.tx.pending[i], &tr.indexPending[i], txComparePendingOrder,
 				func() *cavlNode { return &tr.indexPending[i] })
@@ -480,7 +480,7 @@ func (self *Canard) txPurgeContinuations() {
 // PendingIfaces returns a bitmap of interfaces that have pending transmissions.
 func (self *Canard) PendingIfaces() uint8 {
 	var out uint8
-	for i := 0; i < IfaceCount; i++ {
+	for i := range IfaceCount {
 		if self.tx.pending[i] != nil {
 			out |= uint8(1) << uint(i)
 		}

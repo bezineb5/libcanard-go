@@ -117,10 +117,7 @@ func PumpRX(ctx context.Context, inst *Canard, r FrameReader, now func() int64, 
 // in canData are dropped. This is only correct for Classic CAN transfers -- disable FD
 // (instance.tx.FD = false) when bridging to go.einride.tech/can.
 func CanFrameFromTX(id uint32, data []byte) can.Frame {
-	n := len(data)
-	if n > can.MaxDataLength {
-		n = can.MaxDataLength
-	}
+	n := min(len(data), can.MaxDataLength)
 	f := can.Frame{ID: id, Length: uint8(n), IsExtended: true}
 	copy(f.Data[:n], data)
 	return f

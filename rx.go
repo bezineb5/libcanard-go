@@ -6,16 +6,16 @@ const rxSessionTimeout = 30 * 1000 * 1000 // 30 seconds, in microseconds.
 
 // rxFrameParsed is a single CAN frame parsed into its transfer parameters.
 type rxFrameParsed struct {
-	priority    Prio
-	kind        Kind
-	portID      uint16
-	dst         uint8
-	src         uint8
-	transferID  uint8
-	start       bool
-	end         bool
-	toggle      bool
-	payload     []byte
+	priority   Prio
+	kind       Kind
+	portID     uint16
+	dst        uint8
+	src        uint8
+	transferID uint8
+	start      bool
+	end        bool
+	toggle     bool
+	payload    []byte
 }
 
 // rxParse parses a raw CAN frame into the v0 and/or v1 representations. It returns a bitmask: bit0 set if the frame
@@ -143,7 +143,7 @@ func rxSlotNew(sub *Subscription, startTs int64, transferID uint8, ifaceIndex ui
 		extent:         uint64(extentFull),
 		crc:            sub.CRCSeed,
 		transferID:     transferID & transferIDMax,
-		ifaceIndex:     ifaceIndex,
+		ifaceIndex:     ifaceIndex & ((1 << IfaceCount) - 1),
 		expectedToggle: kindVersion(sub.Kind) != 0,
 		payload:        payload,
 	}
@@ -166,15 +166,15 @@ func rxSlotAdvance(slot *rxSlot, payload []byte) {
 
 // rxSession holds per-remote reassembly state for one subscription, indexed by remote node-ID.
 type rxSession struct {
-	index           cavlNode
-	listAnimation   cavlListed
-	lastAdmissionTs int64
-	slots           [PrioCount]*rxSlot
-	owner           *Subscription
-	nodeID          uint8
+	index                  cavlNode
+	listAnimation          cavlListed
+	lastAdmissionTs        int64
+	slots                  [PrioCount]*rxSlot
+	owner                  *Subscription
+	nodeID                 uint8
 	lastAdmittedTransferID uint8
-	lastAdmittedPriority    uint8
-	ifaceIndex       uint8
+	lastAdmittedPriority   uint8
+	ifaceIndex             uint8
 }
 
 type rxSessionFactoryCtx struct {
@@ -191,13 +191,14 @@ func rxSessionCompare(key *cavlNode, node *cavlNode) int32 {
 
 func rxSessionFactory(ctx *rxSessionFactoryCtx) *cavlNode {
 	ses := &rxSession{
-		owner:          ctx.owner,
-		ifaceIndex:     ctx.ifaceIndex,
-		nodeID:         ctx.nodeID,
+		owner:           ctx.owner,
+		ifaceIndex:      ctx.ifaceIndex,
+		nodeID:          ctx.nodeID,
 		lastAdmissionTs: bigBang,
 	}
 	ses.index.owner = ses
-	for i := 0; i < PrioCount; i++ {
+	ses.listAnimation.owner = ses
+	for i := range PrioCount {
 		ses.slots[i] = nil
 	}
 	enlistTail(&ctx.owner.Owner.rx.listSessionByAnimation, &ses.listAnimation)
@@ -206,7 +207,7 @@ func rxSessionFactory(ctx *rxSessionFactoryCtx) *cavlNode {
 
 func rxSessionDestroy(ses *rxSession) {
 	sub := ses.owner
-	for i := 0; i < PrioCount; i++ {
+	for i := range PrioCount {
 		rxSlotDestroy(sub, ses.slots[i])
 	}
 	cavlRemove(&sub.Sessions, &ses.index)
@@ -216,7 +217,7 @@ func rxSessionDestroy(ses *rxSession) {
 func rxSessionCleanup(ses *rxSession, now int64) int {
 	deadline := now - later(rxSessionTimeout, ses.owner.TransferIDTimeout)
 	n := 0
-	for i := 0; i < PrioCount; i++ {
+	for i := range PrioCount {
 		slot := ses.slots[i]
 		if slot == nil {
 			continue
@@ -305,7 +306,7 @@ func rxSessionRecordAdmission(ses *rxSession, priority Prio, transferID uint8, t
 	ses.lastAdmissionTs = ts
 	ses.lastAdmittedTransferID = transferID & transferIDMax
 	ses.lastAdmittedPriority = uint8(priority) & ((1 << PrioBits) - 1)
-	ses.ifaceIndex = ifaceIndex
+	ses.ifaceIndex = ifaceIndex & ((1 << IfaceCount) - 1)
 }
 
 func rxSessionSolveAdmission(ses *rxSession, ts int64, priority Prio, start bool, toggle bool, transferID uint8, ifaceIndex uint8) bool {
@@ -413,7 +414,7 @@ func rxFilterForSubscription(self *Canard, kind Kind, portID uint16) Filter {
 	case KindV0Message:
 		f.ExtendedCANID = uint32(portID) << 8
 		if portID <= 3 {
-			f.ExtendedMask = 0x0000FF80
+			f.ExtendedMask = 0x00000380
 		} else {
 			f.ExtendedMask = 0x00FFFF80
 		}
@@ -438,7 +439,7 @@ func rxFilterRank(a Filter) uint8 {
 }
 
 func rxFilterCovered(count int, filters []Filter, inner Filter) bool {
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if ((filters[i].ExtendedMask & ^inner.ExtendedMask) == 0) &&
 			((inner.ExtendedCANID & filters[i].ExtendedMask) == filters[i].ExtendedCANID) {
 			return true
@@ -453,7 +454,7 @@ func rxFilterCoalesceInto(count int, into []Filter, newF Filter) {
 	bestJ := count
 	var bestRank uint8
 	var bestFuse Filter
-	for i := 0; i < count; i++ {
+	for i := range count {
 		for j := i + 1; j <= count; j++ {
 			var f Filter
 			if j < count {
@@ -493,7 +494,7 @@ func (self *Canard) rxFilterConfigure() bool {
 	capacity := self.rx.filterCount
 	filters := make([]Filter, capacity)
 	n := 0
-	for kind := Kind(0); kind < KindCount; kind++ {
+	for kind := range Kind(KindCount) {
 		cavlIterate(self.rx.subscriptions[kind], func(node *cavlNode) {
 			sub := node.owner.(*Subscription)
 			rxFilterAppend(filters, &n, capacity, rxFilterForSubscription(self, kind, sub.PortID))

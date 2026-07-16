@@ -46,3 +46,8 @@ func CrcSeedFromDataTypeSignature(dataTypeSignature uint64) uint16 {
 	}
 	return crc
 }
+
+// v0CRCSeedFromDataTypeSignature is an alias for CrcSeedFromDataTypeSignature for compatibility with test names.
+func v0CRCSeedFromDataTypeSignature(dataTypeSignature uint64) uint16 {
+	return CrcSeedFromDataTypeSignature(dataTypeSignature)
+}
