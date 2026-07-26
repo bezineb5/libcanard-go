@@ -1,4 +1,4 @@
-module github.com/benjamin/libcanard-go
+module github.com/bezineb5/libcanard-go
 
 go 1.26.5
 
