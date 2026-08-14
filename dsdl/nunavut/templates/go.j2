@@ -1,0 +1,49 @@
+{# ============================================================================ #}
+{# Nunavut Go Template for libcanard-go                                      #}
+{#                                                                           #}
+{# This template generates Go structs from DSDL definitions that integrate   #}
+{# seamlessly with the dsdl package in libcanard-go.                        #}
+{#                                                                           #}
+{# Usage:                                                                     #}
+{#   nunavut --template go.j2 --outdir ./generated ./dsdl/**/*.dsdl          #}
+{# ============================================================================ #}
+
+{# -------------------------------------------------------------------------- #}
+{# IMPORTS                                                                   #}
+{# -------------------------------------------------------------------------- #}
+
+{% import 'type_map.j2' as type_map %}
+{% import 'helpers.j2' as helpers %}
+
+{# -------------------------------------------------------------------------- #}
+{# TEMPLATE CONFIGURATION                                                    #}
+{# -------------------------------------------------------------------------- #}
+
+{# Enable auto-escaping for Go code #}
+{% autoescape true %}
+
+{# -------------------------------------------------------------------------- #}
+{# MAIN TEMPLATE                                                            #}
+{# -------------------------------------------------------------------------- #}
+
+{{ helpers.header() }}
+
+{% for namespace in namespaces %}
+{{ helpers.namespace_package(namespace) }}
+
+{% for type in namespace.all_types %}
+{% if type.is_message_type %}
+{{ helpers.message_type(type) }}
+
+{% elif type.is_service_type %}
+{{ helpers.service_type(type) }}
+
+{% endif %}
+{% endfor %}
+
+{% endfor %}
+
+{# -------------------------------------------------------------------------- #}
+{# HELPER MACROS (defined in helpers.j2)                                    #}
+{# These are imported above and provide the actual generation logic          #}
+{# -------------------------------------------------------------------------- #}

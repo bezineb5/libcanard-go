@@ -1,0 +1,191 @@
+{# ============================================================================ #}
+{# Type Mapping Template for Nunavut Go                                     #}
+{#                                                                           #}
+{# This file contains type mapping utilities for converting DSDL types to    #}
+{# Go types.                                                                #}
+{# ============================================================================ #}
+
+{# -------------------------------------------------------------------------- #}
+{# DSDL TO GO TYPE MAPPINGS                                                 #}
+{# -------------------------------------------------------------------------- #}
+
+{%- macro dsdl_to_go_type(dsdl_type, signed=True, float16_as_float32=True) -%}
+    {# Handle void types (fixed-size byte arrays) #}
+    {% if dsdl_type.category == 'VoidType' %}
+        [{{ dsdl_type.value_type.bit_length / 8 }}]byte
+    
+    {# Handle boolean #}
+    {% elif dsdl_type.category == 'BooleanType' %}
+        bool
+    
+    {# Handle integer types #}
+    {% elif dsdl_type.category == 'IntegerType' %}
+        {% if signed %}
+            {% if dsdl_type.bit_length == 8 %}int8
+            {% elif dsdl_type.bit_length == 16 %}int16
+            {% elif dsdl_type.bit_length == 32 %}int32
+            {% elif dsdl_type.bit_length == 64 %}int64
+            {% else %}int{{ dsdl_type.bit_length }}
+            {% endif %}
+        {% else %}
+            {% if dsdl_type.bit_length == 8 %}uint8
+            {% elif dsdl_type.bit_length == 16 %}uint16
+            {% elif dsdl_type.bit_length == 32 %}uint32
+            {% elif dsdl_type.bit_length == 64 %}uint64
+            {% else %}uint{{ dsdl_type.bit_length }}
+            {% endif %}
+        {% endif %}
+    
+    {# Handle floating point types #}
+    {% elif dsdl_type.category == 'FloatType' %}
+        {% if dsdl_type.bit_length == 16 and float16_as_float32 %}
+            float32  {# float16 mapped to float32 for Go #}
+        {% elif dsdl_type.bit_length == 32 %}
+            float32
+        {% elif dsdl_type.bit_length == 64 %}
+            float64
+        {% else %}
+            float{{ dsdl_type.bit_length }}
+        {% endif %}
+    
+    {# Handle string types (not commonly used in Cyphal, but supported) #}
+    {% elif dsdl_type.category == 'StringType' %}
+        string
+    
+    {# Handle composite types - use the resolved type name #}
+    {% elif dsdl_type.category in ['CompositeType', 'MessageType', 'ServiceType'] %}
+        {{ dsdl_type.name | go_type_name }}
+    
+    {# Handle array types #}
+    {% elif dsdl_type.category == 'ArrayType' %}
+        [{{ dsdl_type.capacity }}]{{ dsdl_to_go_type(dsdl_type.value_type, signed, float16_as_float32) }}
+    
+    {# Handle variable-length array types (not commonly used in Cyphal) #}
+    {% elif dsdl_type.category == 'VariableLengthArrayType' %}
+        []{{ dsdl_to_go_type(dsdl_type.value_type, signed, float16_as_float32) }}
+    
+    {# Handle void (no type) #}
+    {% elif dsdl_type.category == 'Void' %}
+        struct{}
+    
+    {# Default fallback #}
+    {% else %}
+        {{ dsdl_type | string | replace('.', '_') | replace('#', '_') | title }}
+    {% endif %}
+{%- endmacro -%}
+
+
+{%- macro dsdl_to_go_type_name(dsdl_type) -%}
+    {# Convert a DSDL type reference to a Go type name #}
+    {% if dsdl_type is none %}
+        {{ "" }}
+    {% elif dsdl_type.category == 'VoidType' %}
+        [{{ dsdl_type.value_type.bit_length / 8 }}]byte
+    {% elif dsdl_type.category == 'BooleanType' %}
+        bool
+    {% elif dsdl_type.category == 'IntegerType' %}
+        {% if dsdl_type.signed %}
+            {% if dsdl_type.bit_length == 8 %}int8
+            {% elif dsdl_type.bit_length == 16 %}int16
+            {% elif dsdl_type.bit_length == 32 %}int32
+            {% elif dsdl_type.bit_length == 64 %}int64
+            {% else %}int{{ dsdl_type.bit_length }}
+            {% endif %}
+        {% else %}
+            {% if dsdl_type.bit_length == 8 %}uint8
+            {% elif dsdl_type.bit_length == 16 %}uint16
+            {% elif dsdl_type.bit_length == 32 %}uint32
+            {% elif dsdl_type.bit_length == 64 %}uint64
+            {% else %}uint{{ dsdl_type.bit_length }}
+            {% endif %}
+        {% endif %}
+    {% elif dsdl_type.category == 'FloatType' %}
+        {% if dsdl_type.bit_length == 16 %}float32
+        {% elif dsdl_type.bit_length == 32 %}float32
+        {% elif dsdl_type.bit_length == 64 %}float64
+        {% else %}float{{ dsdl_type.bit_length }}
+        {% endif %}
+    {% elif dsdl_type.category == 'StringType' %}
+        string
+    {% elif dsdl_type.category in ['CompositeType', 'MessageType', 'ServiceType'] %}
+        {{ dsdl_type.name | go_type_name }}
+    {% elif dsdl_type.category == 'ArrayType' %}
+        [{{ dsdl_type.capacity }}]{{ dsdl_to_go_type_name(dsdl_type.value_type) }}
+    {% else %}
+        {{ dsdl_type.name | go_type_name }}
+    {% endif %}
+{%- endmacro -%}
+
+
+{%- macro is_numeric_type(dsdl_type) -%}
+    {{ dsdl_type.category in ['IntegerType', 'FloatType'] }}
+{%- endmacro -%}
+
+
+{%- macro is_integer_type(dsdl_type) -%}
+    {{ dsdl_type.category == 'IntegerType' }}
+{%- endmacro -%}
+
+
+{%- macro is_float_type(dsdl_type) -%}
+    {{ dsdl_type.category == 'FloatType' }}
+{%- endmacro -%}
+
+
+{%- macro is_array_type(dsdl_type) -%}
+    {{ dsdl_type.category == 'ArrayType' }}
+{%- endmacro -%}
+
+
+{%- macro get_type_size(dsdl_type) -%}
+    {# Return the size in bytes for a DSDL type #}
+    {% if dsdl_type.category == 'VoidType' %}
+        {{ dsdl_type.value_type.bit_length / 8 }}
+    {% elif dsdl_type.category == 'BooleanType' %}
+        1
+    {% elif dsdl_type.category == 'IntegerType' %}
+        {{ dsdl_type.bit_length / 8 }}
+    {% elif dsdl_type.category == 'FloatType' %}
+        {% if dsdl_type.bit_length == 16 %}2
+        {% elif dsdl_type.bit_length == 32 %}4
+        {% elif dsdl_type.bit_length == 64 %}8
+        {% else %}{{ dsdl_type.bit_length / 8 }}
+        {% endif %}
+    {% elif dsdl_type.category == 'StringType' %}
+        1  {# Will be handled differently #}
+    {% elif dsdl_type.category == 'ArrayType' %}
+        {{ get_type_size(dsdl_type.value_type) * dsdl_type.capacity }}
+    {% elif dsdl_type.category in ['CompositeType', 'MessageType'] %}
+        {{ dsdl_type.extent / 8 if dsdl_type.extent else 0 }}
+    {% else %}
+        0
+    {% endif %}
+{%- endmacro -%}
+
+
+{%- macro get_alignment(dsdl_type) -%}
+    {# Return the alignment requirement in bytes for a DSDL type #}
+    {% if dsdl_type.category == 'VoidType' %}
+        1
+    {% elif dsdl_type.category == 'BooleanType' %}
+        1
+    {% elif dsdl_type.category == 'IntegerType' %}
+        {{ dsdl_type.bit_length / 8 }}
+    {% elif dsdl_type.category == 'FloatType' %}
+        {% if dsdl_type.bit_length == 16 %}2
+        {% elif dsdl_type.bit_length == 32 %}4
+        {% elif dsdl_type.bit_length == 64 %}8
+        {% else %}{{ dsdl_type.bit_length / 8 }}
+        {% endif %}
+    {% elif dsdl_type.category == 'ArrayType' %}
+        {{ get_alignment(dsdl_type.value_type) }}
+    {% elif dsdl_type.category in ['CompositeType', 'MessageType'] %}
+        {% if dsdl_type.alignment %}
+            {{ dsdl_type.alignment / 8 }}
+        {% else %}
+            1
+        {% endif %}
+    {% else %}
+        1
+    {% endif %}
+{%- endmacro -%}
