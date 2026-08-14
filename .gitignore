@@ -24,5 +24,6 @@ vendor/
 .DS_Store
 
 # Upstream C reference implementation (kept on disk, not tracked)
-/libcanard/
-/tests/
+/c-libcanard/
+/c-tests/
+/c-cy/

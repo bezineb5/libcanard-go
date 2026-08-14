@@ -14,8 +14,8 @@
 //
 // The adapter only depends on the root can package, which carries at most
 // can.MaxDataLength (8) data bytes per frame; go.einride.tech/can therefore models
-// Classic CAN. When bridging to it, configure the instance for Classic CAN by setting
-// instance.tx.FD = false (or use V0Publish / Publish13b with the Classic MTU).
+// Classic CAN. When bridging to it, configure the instance for Classic CAN via SetClassicCAN(true)
+// (or use V0Publish / Publish13b with the Classic MTU).
 package libcanard
 
 import (

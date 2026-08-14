@@ -68,6 +68,25 @@ func (self *Canard) SetNodeID(nodeID uint8) bool {
 	return ok
 }
 
+// SetClassicCAN enables or disables Classic CAN (vs CAN FD) framing for this instance.
+//
+// By default a Canard instance uses CAN FD (tx.FD = true), which permits up to 64-byte frames.
+// Many embedded CAN controllers (e.g. the MCP2515 behind an I2C-CAN bridge) only support
+// Classic CAN with an 8-byte MTU. Call SetClassicCAN(true) before publishing to force every
+// subsequent transfer to use the Classic CAN MTU, matching such controllers. This is purely a
+// per-instance MTU switch and produces wire frames identical to OpenCyphal/libcanard running in
+// Classic CAN mode, so it is compatible with any compliant Cyphal/CAN v1.x receiver.
+//
+// It affects Publish16b, Publish13b, and the service publish paths (all of which consult tx.FD);
+// V0Publish already uses Classic CAN unconditionally. Safe to call at any time, but avoid changing
+// it while transfers are pending, as in-flight multi-frame transfers would mix MTUs.
+func (self *Canard) SetClassicCAN(enabled bool) {
+	if self == nil {
+		return
+	}
+	self.tx.FD = !enabled
+}
+
 // Poll drives the TX pipeline and reconfigures RX filters if dirty. It must be called periodically and whenever any
 // interface with pending transmissions becomes writable.
 func (self *Canard) Poll(txReadyIfaceBitmap uint8) {
