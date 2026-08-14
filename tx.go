@@ -389,7 +389,7 @@ func (self *Canard) txPush(tr *txTransfer, v0 bool, ifaceBitmap uint8, transferI
 		memFree(self.Mem.TXTransfer, 0, unsafe.Pointer(tr))
 		return false
 	}
-	now := self.VTable.Now(self)
+	now := self.Platform.Now(self)
 	self.txExpire(now)
 
 	mtu := MTUFD
@@ -448,7 +448,7 @@ func (self *Canard) txEjectPending(ifaceIndex uint8) {
 		data := txFrameView(frame)
 		if len(data) == 0 {
 		}
-		ejected := self.VTable.TX(self, tr.userContext, tr.deadline, ifaceIndex, tr.fd, canID, data)
+		ejected := self.Platform.TX(self, tr.userContext, tr.deadline, ifaceIndex, tr.fd, canID, data)
 		if !ejected {
 			break
 		}

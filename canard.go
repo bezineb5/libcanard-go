@@ -14,9 +14,9 @@ func boolToUint32(b bool) uint32 {
 }
 
 // New allocates and initializes a new Canard instance. It returns (instance, true) on success.
-func New(vtable *VTable, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, prngSeed uint64, filterCount int) (*Canard, bool) {
+func New(platform Platform, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, prngSeed uint64, filterCount int) (*Canard, bool) {
 	self := &Canard{}
-	ok := self.Init(vtable, memory, ifaceBitmap, txQueueCapacity, prngSeed, filterCount)
+	ok := self.Init(platform, memory, ifaceBitmap, txQueueCapacity, prngSeed, filterCount)
 	if !ok {
 		return nil, false
 	}
@@ -25,10 +25,10 @@ func New(vtable *VTable, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, 
 
 // Init initializes the instance in place (equivalent to canard_new). It returns true on success, false if any of the
 // parameters are invalid.
-func (self *Canard) Init(vtable *VTable, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, prngSeed uint64, filterCount int) bool {
-	filterOK := (filterCount == 0) || (vtable != nil && vtable.Filter != nil && memValid(memory.RXFilters))
+func (self *Canard) Init(platform Platform, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, prngSeed uint64, filterCount int) bool {
+	filterOK := (filterCount == 0) || memValid(memory.RXFilters)
 	ifaceOK := (ifaceBitmap & IfaceBitmapAll) == ifaceBitmap
-	ok := self != nil && vtable != nil && vtable.Now != nil && vtable.TX != nil &&
+	ok := self != nil && platform != nil &&
 		memValid(memory.TXTransfer) && memValid(memory.TXFrame) && memValid(memory.RXSession) && memValid(memory.RXPayload) &&
 		filterOK && ifaceOK
 	if ok {
@@ -40,7 +40,7 @@ func (self *Canard) Init(vtable *VTable, memory MemSet, ifaceBitmap uint8, txQue
 		self.rx.filtersDirty = filterCount > 0
 		self.Mem = memory
 		self.PRNGState = prngSeed ^ uint64(uintptr(unsafe.Pointer(self)))
-		self.VTable = vtable
+		self.Platform = platform
 		self.NodeID = uint8(random(self, NodeIDMax) + 1) // [1, 127]
 		nodeIDOccupancyReset(self)
 	}
@@ -96,13 +96,13 @@ func (self *Canard) Poll(txReadyIfaceBitmap uint8) {
 	self.rx.filtersDirty = self.rx.filtersDirty && !self.rxFilterConfigure()
 	ses := listHead[rxSession](&self.rx.listSessionByAnimation)
 	if ses != nil {
-		now := self.VTable.Now(self)
+		now := self.Platform.Now(self)
 		inProgress := rxSessionCleanup(ses, now)
 		if inProgress == 0 && ses.lastAdmissionTs < (now-ses.owner.TransferIDTimeout) {
 			rxSessionDestroy(ses)
 		}
 	}
-	self.txExpire(self.VTable.Now(self))
+	self.txExpire(self.Platform.Now(self))
 	for i := range IfaceCount {
 		if (txReadyIfaceBitmap & (1 << uint(i))) != 0 {
 			self.txEjectPending(uint8(i))

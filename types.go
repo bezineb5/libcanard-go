@@ -270,19 +270,57 @@ type Subscription struct {
 	UserContext any
 }
 
-// VTable carries the callbacks the library invokes to interact with the platform.
-type VTable struct {
+// Platform provides the callbacks the library invokes to interact with the underlying system.
+// This interface replaces the original C-style vtable with a Go-idiomatic approach.
+type Platform interface {
 	// Now returns the current monotonic time in microseconds. Must be a non-negative non-decreasing value.
-	Now func(self *Canard) int64
+	Now(self *Canard) int64
 
 	// TX submits one CAN frame for transmission via the specified interface. It returns true if the frame was
 	// accepted for transmission, false if there is no free mailbox (try again later). The callback must not mutate
 	// the TX pipeline (no Publish/Cancel/Free/etc).
-	TX func(self *Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool
+	TX(self *Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool
 
-	// Filter reconfigures the acceptance filters of the CAN controller hardware. It returns true on success. This
-	// function may be nil if filtering is unsupported. It is only invoked from Poll.
-	Filter func(self *Canard, filterCount int, filters []Filter) bool
+	// Filter reconfigures the acceptance filters of the CAN controller hardware. It returns true on success.
+	// Implementations that do not support hardware filtering should return true to indicate all filters are accepted.
+	Filter(self *Canard, filterCount int, filters []Filter) bool
+}
+
+// VTable is deprecated. Use Platform instead.
+type VTable = Platform
+
+// NewPlatform creates a Platform implementation from function callbacks.
+// This is a helper for creating Platform implementations without defining a new type.
+func NewPlatform(now func(self *Canard) int64, tx func(self *Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool, filter func(self *Canard, filterCount int, filters []Filter) bool) Platform {
+	return &platformImpl{now: now, tx: tx, filter: filter}
+}
+
+// platformImpl is the internal implementation returned by NewPlatform.
+type platformImpl struct {
+	now    func(self *Canard) int64
+	tx     func(self *Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool
+	filter func(self *Canard, filterCount int, filters []Filter) bool
+}
+
+func (p *platformImpl) Now(self *Canard) int64 {
+	if p.now != nil {
+		return p.now(self)
+	}
+	return 0
+}
+
+func (p *platformImpl) TX(self *Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool {
+	if p.tx != nil {
+		return p.tx(self, userContext, deadline, ifaceIndex, fd, extendedCANID, canData)
+	}
+	return false
+}
+
+func (p *platformImpl) Filter(self *Canard, filterCount int, filters []Filter) bool {
+	if p.filter != nil {
+		return p.filter(self, filterCount, filters)
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -333,7 +371,7 @@ type Canard struct {
 	Mem       MemSet
 	PRNGState uint64
 
-	VTable *VTable
+	Platform Platform
 
 	UserContext any
 }

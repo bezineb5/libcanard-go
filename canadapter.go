@@ -110,7 +110,7 @@ func PumpRX(ctx context.Context, inst *Canard, r FrameReader, now func() int64, 
 // TX: emitting transmitted frames.
 // ---------------------------------------------------------------------------------------------------------------------
 
-// CanFrameFromTX builds a can.Frame from the arguments of the VTable.TX callback. Cyphal/CAN
+// CanFrameFromTX builds a can.Frame from the arguments of the Platform.TX callback. Cyphal/CAN
 // frames are always extended (29-bit) and never remote, so the result always has IsExtended set.
 //
 // Note that can.Frame carries at most can.MaxDataLength (8) bytes of data; any additional bytes
@@ -123,7 +123,7 @@ func CanFrameFromTX(id uint32, data []byte) can.Frame {
 	return f
 }
 
-// TXToChannel returns a VTable.TX callback that delivers transmitted frames as can.Frame values
+// TXToChannel returns a Platform.TX callback that delivers transmitted frames as can.Frame values
 // to ch. The channel must have enough capacity to avoid blocking the TX pipeline.
 //
 // Example:
@@ -146,7 +146,7 @@ func TXToChannel(ch chan<- can.Frame) func(*Canard, any, int64, uint8, bool, uin
 	}
 }
 
-// TXToFrameWriter returns a VTable.TX callback that writes each transmitted frame to w via
+// TXToFrameWriter returns a Platform.TX callback that writes each transmitted frame to w via
 // TransmitFrame, using ctx for the write. It reports success (true) on a successful write, and
 // false on a write error so the frame is retried later. The callback forwards the frame verbatim,
 // including its 29-bit extended ID.
@@ -168,7 +168,7 @@ func TXToFrameWriter(w FrameWriter, ctx context.Context) func(*Canard, any, int6
 // Return false to signal a busy interface (the frame is retried later).
 type TXFunc func(frame can.Frame) bool
 
-// TXToFunc returns a VTable.TX callback that forwards each transmitted frame to fn. This is handy
+// TXToFunc returns a Platform.TX callback that forwards each transmitted frame to fn. This is handy
 // for custom sinks (logging, virtual CAN, test harnesses) without introducing a channel.
 func TXToFunc(fn TXFunc) func(*Canard, any, int64, uint8, bool, uint32, []byte) bool {
 	return func(_ *Canard, _ any, _ int64, _ uint8, _ bool, id uint32, data []byte) bool {
@@ -177,16 +177,16 @@ func TXToFunc(fn TXFunc) func(*Canard, any, int64, uint8, bool, uint32, []byte) 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// VTable helpers.
+// Platform helpers.
 // ---------------------------------------------------------------------------------------------------------------------
 
-// NowFunc returns a VTable.Now implementation backed by the provided clock. The clock must yield
+// NowFunc returns a Platform.Now implementation backed by the provided clock. The clock must yield
 // a non-negative, non-decreasing monotonic time in microseconds.
 func NowFunc(now func() int64) func(self *Canard) int64 {
 	return func(self *Canard) int64 { return now() }
 }
 
-// FilterAcceptAll returns a VTable.Filter implementation that reports success unconditionally.
+// FilterAcceptAll returns a Platform.Filter implementation that reports success unconditionally.
 // Use it when the CAN controller performs no hardware acceptance filtering (libcanard then does
 // all routing in software, which is the case when reading every frame through go.einride.tech/can).
 func FilterAcceptAll(self *Canard, count int, filters []Filter) bool { return true }
@@ -208,7 +208,7 @@ func (self *Canard) FlushTX() {
 
 // Conn couples a Canard instance with a CAN interface for bidirectional transfer. The Reader
 // supplies received frames (ingested via PumpRX); the Writer consumes transmitted frames (the
-// instance's VTable.TX should be set to TXToFrameWriter(Conn.Writer, ...)).
+// instance's Platform.TX should be set to TXToFrameWriter(Conn.Writer, ...)).
 //
 // Example:
 //

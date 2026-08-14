@@ -513,7 +513,7 @@ func (self *Canard) rxFilterConfigure() bool {
 			rxFilterAppend(filters, &n, capacity, g)
 		}
 	}
-	ok := self.VTable.Filter(self, n, filters[:n])
+	ok := self.Platform.Filter(self, n, filters[:n])
 	return ok
 }
 
