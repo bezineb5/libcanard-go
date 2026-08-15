@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/opencyphal/cy-go/rapidhash"
+	"go.dw1.io/rapidhash"
 )
 
 // Topic represents a Cyphal topic.

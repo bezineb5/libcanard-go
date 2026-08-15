@@ -6,7 +6,7 @@ import (
 
 	"github.com/opencyphal/cy-go/cavl"
 	"github.com/opencyphal/cy-go/olga"
-	"github.com/opencyphal/cy-go/rapidhash"
+	"go.dw1.io/rapidhash"
 )
 
 // Cy is the main Cyphal instance.
