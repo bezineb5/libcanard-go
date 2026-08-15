@@ -364,25 +364,29 @@ func (n *SimNetwork) GetNode(index int) *SimNode {
 }
 
 // ProcessMessages processes all pending messages in the network.
+// Messages are popped under the network lock and delivered outside it, so that a
+// node's message handler may call back into the network (e.g. platform.Now())
+// without deadlocking on the network mutex.
 func (n *SimNetwork) ProcessMessages() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	
-	for len(n.messages) > 0 {
+	for {
+		n.mu.Lock()
+		if len(n.messages) == 0 {
+			n.mu.Unlock()
+			return
+		}
 		msg := n.messages[0]
 		n.messages = n.messages[1:]
-		
-		// Deliver to all nodes (for multicast) or specific node (for unicast)
+		n.mu.Unlock()
+
+		// Deliver to all nodes (for multicast) or a specific node (for unicast).
+		// Deliver outside the network lock to avoid lock-ordering deadlocks.
 		if msg.To == 0 {
-			// Multicast - deliver to all nodes
 			for _, node := range n.nodes {
 				if node.ID != msg.From {
-					// Deliver to this node
 					n.deliverToNode(node, msg)
 				}
 			}
 		} else {
-			// Unicast - deliver to specific node
 			for _, node := range n.nodes {
 				if node.ID == msg.To {
 					n.deliverToNode(node, msg)

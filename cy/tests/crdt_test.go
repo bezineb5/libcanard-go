@@ -326,52 +326,33 @@ func TestCRDTUpdateLogAge(t *testing.T) {
 	}
 }
 
-// TestCRDTUpdateFromGossip tests updating from gossip data.
-func TestCRDTUpdateFromGossip(t *testing.T) {
-	platform := NewMockPlatform()
-	
-	node, err := cy.New(platform, "test_node", "", "")
-	if err != nil {
-		t.Fatalf("Failed to create Cy instance: %v", err)
-	}
-	defer node.Destroy()
-	
-	crdt := node.CRDT()
-	
-	// Add a topic
+// TestCRDTGossipWireRoundTrip tests the C-compatible gossip wire format
+// (24-byte header + name) round-trips through Marshal/Parse.
+func TestCRDTGossipWireRoundTrip(t *testing.T) {
+	lage := int8(7)
 	hash := uint64(0x123456789ABCDEF0)
-	crdt.AddTopic("test.topic", hash)
-	
-	// Get the current state
-	state, _ := crdt.GetTopic(hash)
-	originalLogAge := state.LogAge()
-	
-	// Create gossip data with newer log-age
-	gossipData := make([]byte, 16)
-	// Write hash
-	for i := 0; i < 8; i++ {
-		gossipData[i] = byte(hash >> (i * 8))
+	evictions := uint32(42)
+	name := "sensors/temperature"
+
+	wire := cy.MarshalGossipMessage(lage, hash, uint64(evictions), name)
+	if len(wire) != cy.HeaderSize+len(name) {
+		t.Fatalf("Expected wire length %d, got %d", cy.HeaderSize+len(name), len(wire))
 	}
-	// Write newer log-age
-	newLogAge := originalLogAge + 1
-	for i := 0; i < 4; i++ {
-		gossipData[8+i] = byte(uint32(newLogAge) >> (i * 8))
+	// The header type byte must be the gossip type.
+	if cy.HeaderType(wire[0]) != cy.HeaderTypeGossip {
+		t.Errorf("Expected gossip header type, got %d", wire[0])
 	}
-	// Write evictions
-	for i := 0; i < 4; i++ {
-		gossipData[12+i] = 0
+	// The trailing name length byte (offset 23) must match.
+	if wire[23] != byte(len(name)) {
+		t.Errorf("Expected name length %d at byte 23, got %d", len(name), wire[23])
 	}
-	
-	// Update from gossip
-	updated := crdt.UpdateFromGossip(gossipData)
-	if !updated {
-		t.Error("Expected update from gossip")
+
+	parsed, err := cy.ParseGossipMessage(wire)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
 	}
-	
-	// Verify the state was updated
-	state, _ = crdt.GetTopic(hash)
-	if state.LogAge() != newLogAge {
-		t.Errorf("Expected log-age %d, got %d", newLogAge, state.LogAge())
+	if parsed.Lage != lage || parsed.Hash != hash || parsed.Evictions != evictions || parsed.Name != name {
+		t.Errorf("Round-trip mismatch: got %+v", parsed)
 	}
 }
 
@@ -442,30 +423,42 @@ func TestCRDTReset(t *testing.T) {
 	}
 }
 
-// TestCRDTSubjectIDModulus tests subject-ID modulus configuration.
+// TestCRDTSubjectIDModulus tests subject-ID modulus configuration and validation.
 func TestCRDTSubjectIDModulus(t *testing.T) {
 	platform := NewMockPlatform()
-	
+
 	node, err := cy.New(platform, "test_node", "", "")
 	if err != nil {
 		t.Fatalf("Failed to create Cy instance: %v", err)
 	}
 	defer node.Destroy()
-	
+
 	crdt := node.CRDT()
-	
-	// Check default modulus
+
+	// The default modulus must be valid (prime, mod 4 == 3, >= 16-bit modulus).
 	defaultModulus := crdt.SubjectIDModulus()
 	if defaultModulus == 0 {
 		t.Error("Expected non-zero default modulus")
 	}
-	
-	// Set new modulus
-	newModulus := uint32(1024)
-	crdt.SetSubjectIDModulus(newModulus)
-	
-	if crdt.SubjectIDModulus() != newModulus {
-		t.Errorf("Expected modulus %d, got %d", newModulus, crdt.SubjectIDModulus())
+	if !cy.IsValidSubjectIDModulus(defaultModulus) {
+		t.Errorf("Default modulus %d should be valid", defaultModulus)
+	}
+
+	// A valid alternative modulus (the 23-bit constant) is accepted.
+	if err := node.SetSubjectIDModulus(cy.SubjectIDModulus23bit); err != nil {
+		t.Fatalf("Expected to accept valid modulus, got: %v", err)
+	}
+	if crdt.SubjectIDModulus() != cy.SubjectIDModulus23bit {
+		t.Errorf("Expected modulus %d, got %d", cy.SubjectIDModulus23bit, crdt.SubjectIDModulus())
+	}
+
+	// An invalid modulus (not prime, too small) is rejected and leaves the
+	// previous modulus in place.
+	if err := node.SetSubjectIDModulus(1024); err == nil {
+		t.Error("Expected rejection of invalid modulus 1024")
+	}
+	if crdt.SubjectIDModulus() != cy.SubjectIDModulus23bit {
+		t.Errorf("Modulus should be unchanged after invalid set, got %d", crdt.SubjectIDModulus())
 	}
 }
 

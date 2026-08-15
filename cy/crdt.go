@@ -38,10 +38,14 @@ type TopicState struct {
 	hash uint64
 	// name is the topic name.
 	name string
-	// logAge is the log2 of seconds since topic creation.
+	// logAge is the log2 of seconds since topic creation (cached wire value).
 	logAge int32
 	// evictions is the number of times this topic has been evicted and recreated.
 	evictions uint32
+	// tsOrigin approximates when the topic was first seen on the network. The
+	// authoritative log-age is derived from it via topic_lage(); this mirrors the
+	// C cy_topic_t.ts_origin field.
+	tsOrigin Microsecond
 	// pinned indicates if this topic has a pinned subject-ID.
 	pinned bool
 	// pinnedSubjectID is the explicitly pinned subject-ID.
@@ -81,11 +85,11 @@ func (s *TopicState) PinnedSubjectID() uint32 {
 // NewTopicState creates a new topic state.
 func NewTopicState(name string, hash uint64, logAge int32, evictions uint32) *TopicState {
 	return &TopicState{
-		name:    name,
-		hash:    hash,
-		logAge:  logAge,
+		name:     name,
+		hash:     hash,
+		logAge:   logAge,
 		evictions: evictions,
-		pinned:  false,
+		tsOrigin: 0,
 	}
 }
 
@@ -236,65 +240,6 @@ func (c *CRDT) RemoveTopic(hash uint64) {
 	delete(c.topics, hash)
 }
 
-// GossipData returns the gossip data for a topic.
-func (c *CRDT) GossipData(hash uint64) []byte {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	state, ok := c.topics[hash]
-	if !ok {
-		return nil
-	}
-
-	// Format: [hash:8][logAge:4][evictions:4]
-	data := make([]byte, 16)
-
-	// Write hash (8 bytes, little-endian)
-	for i := 0; i < 8; i++ {
-		data[i] = byte(state.hash >> (i * 8))
-	}
-
-	// Write logAge (4 bytes, little-endian, signed)
-	for i := 0; i < 4; i++ {
-		data[8+i] = byte(uint32(state.logAge) >> (i * 8))
-	}
-
-	// Write evictions (4 bytes, little-endian)
-	for i := 0; i < 4; i++ {
-		data[12+i] = byte(state.evictions >> (i * 8))
-	}
-
-	return data
-}
-
-// ParseGossipData parses gossip data and updates the topic state.
-func (c *CRDT) ParseGossipData(data []byte) (uint64, bool) {
-	if len(data) < 16 {
-		return 0, false
-	}
-
-	// Parse hash
-	var hash uint64
-	for i := 0; i < 8; i++ {
-		hash |= uint64(data[i]) << (i * 8)
-	}
-
-	// Parse logAge
-	var logAge int32
-	for i := 0; i < 4; i++ {
-		logAge |= int32(uint32(data[8+i]) << (i * 8))
-	}
-
-	// Parse evictions
-	var evictions uint32
-	for i := 0; i < 4; i++ {
-		evictions |= uint32(data[12+i]) << (i * 8)
-	}
-
-	// Update the topic state
-	return hash, c.Merge(hash, logAge, evictions)
-}
-
 // Validate checks if the CRDT state is valid.
 func (c *CRDT) Validate() bool {
 	c.mu.RLock()
@@ -380,20 +325,6 @@ func (c *CRDT) GetPendingGossip() []uint64 {
 	pending := c.pendingGossip
 	c.pendingGossip = make([]uint64, 0)
 	return pending
-}
-
-// UpdateFromGossip updates the local state from received gossip data.
-// Returns true if any updates were made.
-func (c *CRDT) UpdateFromGossip(data []byte) bool {
-	hash, updated := c.ParseGossipData(data)
-	if !updated {
-		return false
-	}
-	
-	// Mark this topic for re-gossip
-	c.MarkForGossip(hash)
-	
-	return true
 }
 
 // GetAllTopicStates returns all topic states for gossip.

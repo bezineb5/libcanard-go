@@ -164,7 +164,7 @@ func (p *Publisher) buildWire(data []byte, headerType HeaderType) (uint64, []byt
 	}
 	p.msgSeqno++
 	tag := p.msgTagBaseline + p.msgSeqno
-	header := NewHeader(headerType, int8(p.topic.LogAge()), uint32(p.topic.Evictions()), p.topic.Hash(), tag)
+	header := NewHeader(headerType, int8(p.topic.Lage(p.cy.Now())), uint32(p.topic.Evictions()), p.topic.Hash(), tag)
 	wire := PrependHeader(header, data)
 	return tag, wire, nil
 }

@@ -63,6 +63,17 @@ type Cy struct {
 	// subjectIDModulus is the subject-ID modulus for this network.
 	subjectIDModulus uint32
 
+	// broadcastSubjectID is the subject-ID reserved for broadcast transport
+	// (broadcast gossips, scouts, and other protocol needs). It is the largest
+	// subject-ID of the form 2^k-1 that is >= SubjectIDMax(modulus).
+	broadcastSubjectID uint32
+	// broadWriter is the subject writer for the broadcast subject; urgent and
+	// periodic broadcast gossips are sent through it.
+	broadWriter SubjectWriter
+	// gossipBroadcastRatio: every Nth gossip (and multiples of N) is broadcast for
+	// observability; the rest are sharded. Urgent gossips are always broadcast.
+	gossipBroadcastRatio uint8
+
 	// prngState is the PRNG state for random number generation.
 	prngState uint64
 
@@ -120,8 +131,17 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 	cy.crdt = NewCRDT(cy, SubjectIDModulus16bit)
 	cy.gossip = newGossip(cy)
 
-	// Set up gossip shard count
-	cy.gossip.SetShardCount(1) // Default to 1 shard for now
+	// Set up the gossip/broadcast subject layout. The broadcast subject-ID and the
+	// gossip shard count are derived from the modulus; they must be created before
+	// any topics are allocated so gossip can target the right subjects.
+	cy.subjectIDModulus = SubjectIDModulus16bit
+	cy.broadcastSubjectID = BroadcastSubjectID(cy.subjectIDModulus)
+	cy.gossipBroadcastRatio = GossipBroadcastRatio
+	if err := cy.initBroadcastSubject(); err != nil {
+		return nil, err
+	}
+	cy.gossip.SetShardCount(GossipShardCount(cy.subjectIDModulus))
+	cy.gossip.SetBroadcastRatio(GossipBroadcastRatio)
 
 	// Set up message callback
 	cy.onMessage = func(lane Lane, subjectID *uint32, message MessageTS) {
@@ -159,6 +179,12 @@ func (c *Cy) Destroy() {
 	// Clean up gossip
 	if c.gossip != nil {
 		c.gossip = nil
+	}
+
+	// Clean up the broadcast subject writer
+	if c.broadWriter != nil {
+		c.platform.DestroySubjectWriter(c.broadWriter)
+		c.broadWriter = nil
 	}
 
 	// Clean up RPC
@@ -232,6 +258,14 @@ func (c *Cy) CRDT() *CRDT {
 	return c.crdt
 }
 
+// BroadcastSubjectID returns the subject-ID reserved for broadcast transport
+// (broadcast gossips, scouts, and other protocol needs).
+func (c *Cy) BroadcastSubjectID() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.broadcastSubjectID
+}
+
 // Spin runs the event loop until the specified deadline.
 // This is the main entry point for processing messages and timers.
 func (c *Cy) Spin(deadline Microsecond) error {
@@ -269,41 +303,86 @@ func (c *Cy) HandleMessage(lane Lane, subjectID *uint32, message MessageTS) {
 	}
 }
 
-// handleMulticastMessage handles a multicast message.
-// Mirrors C cy_on_message: read the message tag, then skip the 24-byte session
-// header, then dispatch.
+// handleMulticastMessage handles a multicast/broadcast/shard message.
+// It mirrors C cy_on_message: read the 24-byte session header, skip it, then
+// dispatch on the message type. Data frames carry inline CRDT gossip (subject-ID
+// consistency + collision arbitration); gossip frames drive consensus; scout
+// frames trigger responses.
 func (c *Cy) handleMulticastMessage(lane Lane, subjectID uint32, message MessageTS) {
 	if message.Content == nil || message.Content.Size() < HeaderSize {
 		return
 	}
-	// Extract the message tag (C: header[16:24]) before skipping the header.
-	var tagBuf [8]byte
-	var msgTag uint64
-	if message.Content.Read(16, 8, tagBuf[:]) == 8 {
-		msgTag = binary.LittleEndian.Uint64(tagBuf[:])
+	// Read the header before skipping it.
+	var hdr [HeaderSize]byte
+	if message.Content.Read(0, HeaderSize, hdr[:]) != HeaderSize {
+		return
 	}
+	msgType := HeaderType(hdr[0])
+	lage := int8(hdr[3])
+	// evictions is read per message type below (data: [4:8]; gossip: [16:20]).
+	hash := binary.LittleEndian.Uint64(hdr[8:16])
+	msgTag := binary.LittleEndian.Uint64(hdr[16:24])
 	// C always skips the session header before dispatch.
 	message.Content.Skip(HeaderSize)
 
-	// Determine the dispatch scope (C: multicast vs broadcast vs shard).
-	topic := c.findTopicBySubjectID(subjectID)
-	if topic == nil {
-		// Unknown subject-ID. Above SubjectIDPinnedMax => gossip/aux subject.
-		if subjectID > SubjectIDPinnedMax {
-			c.gossip.ProcessGossip(message.Content.Payload(), subjectID)
-		}
-		return
-	}
+	now := message.Timestamp // C uses the message arrival timestamp for CRDT merge/arbitration.
+	broadcast := subjectID == c.broadcastSubjectID
+	multicast := !broadcast && subjectID <= SubjectIDMax(c.subjectIDModulus)
 
-	// Known topic: deliver to subscribers on this topic.
-	if subs, ok := c.subscribers[topic]; ok {
-		for _, sub := range subs {
-			sub.Deliver(message, lane, msgTag)
+	switch msgType {
+	case HeaderTypeMsgBE, HeaderTypeMsgRel:
+		if broadcast {
+			return // Data frames are never carried on the broadcast subject.
 		}
-	}
-	matches := c.patternMatcher.Match(topic.name)
-	for sub := range matches {
-		sub.Deliver(message, lane, msgTag)
+		reliable := msgType == HeaderTypeMsgRel
+		// For data frames the eviction counter is carried at [4:8].
+		evictions := binary.LittleEndian.Uint32(hdr[4:8])
+		if multicast && ComputeSubjectID(hash, evictions, c.subjectIDModulus) != subjectID {
+			// Inline CRDT gossip is inconsistent with the subject we received on;
+			// the sender is malfunctioning. Drop the frame (C logs and bails).
+			return
+		}
+		topic := c.findTopicByHash(hash)
+		if topic != nil {
+			// Inline CRDT gossip + deliver to subscribers.
+			c.onGossipKnownTopic(topic, evictions, int32(lage), gossipInline, now)
+			if subs, ok := c.subscribers[topic]; ok {
+				for _, sub := range subs {
+					sub.Deliver(message, lane, msgTag)
+				}
+			}
+			for sub := range c.patternMatcher.Match(topic.name) {
+				sub.Deliver(message, lane, msgTag)
+			}
+			_ = reliable
+		} else {
+			// We occupy this subject-ID for a different topic: collision arbitration.
+			c.onGossipUnknownTopic(hash, evictions, int32(lage), now)
+		}
+
+	case HeaderTypeGossip:
+		if multicast {
+			return // Gossip is never carried on a normal multicast subject.
+		}
+		var scope gossipScope
+		if broadcast {
+			scope = gossipBroadcast
+		} else {
+			scope = gossipSharded
+		}
+		// For gossip frames the eviction counter is carried at [16:20] and the
+		// trailing name length at byte 23 (the [16:24] trailer), not at [4:8].
+		evictions := binary.LittleEndian.Uint32(hdr[16:20])
+		// The header has been skipped; the remainder is the topic name.
+		c.gossip.ProcessGossip(lage, hash, uint64(evictions), message.Content.Payload(), subjectID, scope, now)
+
+	case HeaderTypeScout:
+		// TODO: implement scout handling (C on_scout): respond with unicast gossips
+		// for matching local topics. Currently a no-op.
+		_ = broadcast
+
+	default:
+		// Unknown/unsupported multicast type.
 	}
 }
 
@@ -456,13 +535,21 @@ func (c *Cy) Advertise(topicName string) (*Publisher, error) {
 func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.subscribeLocked(topicName, extent, false)
+}
 
+// subscribeLocked resolves a subscription. It assumes c.mu is already held by the
+// caller; this lets the auto-subscribe (gossip) path subscribe from within the
+// handle-message critical section without re-entering the lock.
+func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subscriber, error) {
 	// Resolve the topic name
 	resolvedName := c.resolveTopicName(topicName)
 
 	// Check if this is a pattern subscription
 	if IsPattern(resolvedName) {
-		// Create a pattern subscriber
+		// Pattern subscribers are inherently unordered; an ordered request on a
+		// pattern name still yields a regular pattern subscriber (matches the
+		// pre-existing SubscribeOrdered behavior).
 		sub := NewPatternSubscriber(c, resolvedName, extent)
 
 		// Add to pattern matcher
@@ -477,7 +564,12 @@ func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 		return nil, err
 	}
 	// Create a new subscriber
-	sub := NewSubscriber(c, topic, extent)
+	var sub *Subscriber
+	if ordered {
+		sub = NewOrderedSubscriber(c, topic, extent)
+	} else {
+		sub = NewSubscriber(c, topic, extent)
+	}
 	c.subscribers[topic] = append(c.subscribers[topic], sub)
 
 	return sub, nil
@@ -488,28 +580,7 @@ func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 func (c *Cy) SubscribeOrdered(topicName string, extent int) (*Subscriber, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Resolve the topic name
-	resolvedName := c.resolveTopicName(topicName)
-
-	// Check if this is a pattern subscription
-	if IsPattern(resolvedName) {
-		sub := NewPatternSubscriber(c, resolvedName, extent)
-		c.patternMatcher.AddPattern(resolvedName, sub)
-		return sub, nil
-	}
-
-	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName, extent)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a new subscriber
-	sub := NewSubscriber(c, topic, extent)
-	c.subscribers[topic] = append(c.subscribers[topic], sub)
-
-	return sub, nil
+	return c.subscribeLocked(topicName, extent, true)
 }
 
 // resolveTopicName applies namespace and remapping to a topic name.
@@ -529,7 +600,9 @@ func (c *Cy) resolveTopicName(name string) string {
 
 // findOrCreateTopic finds a topic by name or creates it if it doesn't exist.
 // extent is the maximum message size for the topic (per subscription) and is applied
-// before the platform reader is created.
+// before the platform reader is created. The topic's subject-ID is then allocated
+// (and possibly re-allocated on collision) by topicAllocate. The caller must hold
+// c.mu.
 func (c *Cy) findOrCreateTopic(name string, extent int) (*Topic, error) {
 	// Check if the topic already exists
 	if topic, ok := c.topicsByName[name]; ok {
@@ -542,50 +615,33 @@ func (c *Cy) findOrCreateTopic(name string, extent int) (*Topic, error) {
 	}
 	topic.extent = extent
 
-	// Add to CRDT
+	// Add to CRDT (canonical allocation state). Pinned topics keep their
+	// eviction encoding (UINT32_MAX - subject_id); only non-pinned topics adopt
+	// the CRDT's zero eviction counter.
 	state := c.crdt.AddTopic(name, topic.hash)
-	topic.logAge = state.logAge
-	topic.evictions = state.evictions
-
-	// Recompute subject-ID based on CRDT state
 	if !topic.pinned {
-		topic.subjectID = c.crdt.ComputeSubjectID(topic.hash, topic.evictions)
+		topic.evictions = state.evictions
+	} else {
+		// Pinned topics keep the eviction encoding UINT32_MAX - subject_id, which
+		// is what lets topicAllocate() recognize and preserve them. The CRDT state
+		// carries zero evictions (it has no notion of pinning).
+		topic.evictions = ^topic.pinnedSubjectID
 	}
 
-	// Add to maps
+	// A freshly created topic is observed at 'now', so its log-age is LAGEMin and its
+	// tsOrigin is now. (Auto-subscribed topics instead inherit the remote's age.)
+	now := c.Now()
+	topic.SetOriginAt(now, state.logAge, topic.evictions)
+
+	// Add to the name and hash indexes. The subject-ID index entry is managed by
+	// topicAllocate (which may also re-index on collision).
 	c.topicsByName[name] = topic
 	c.topicsByHash[topic.hash] = topic
-	if !topic.pinned {
-		c.topicsBySubjectID[topic.subjectID] = topic
-	}
 
-	// Create subject reader/writer on the platform
-	reader, err := c.platform.NewSubjectReader(topic.subjectID, topic.extent)
-	if err != nil {
-		// Clean up
-		delete(c.topicsByName, name)
-		delete(c.topicsByHash, topic.hash)
-		if !topic.pinned {
-			delete(c.topicsBySubjectID, topic.subjectID)
-		}
-		c.crdt.RemoveTopic(topic.hash)
-		return nil, err
-	}
+	// Allocate (and, if necessary, re-allocate on collision) the subject-ID.
+	c.topicAllocate(topic, topic.evictions, now)
 
-	_, err = c.platform.NewSubjectWriter(topic.subjectID)
-	if err != nil {
-		// Clean up reader
-		c.platform.DestroySubjectReader(reader)
-		delete(c.topicsByName, name)
-		delete(c.topicsByHash, topic.hash)
-		if !topic.pinned {
-			delete(c.topicsBySubjectID, topic.subjectID)
-		}
-		c.crdt.RemoveTopic(topic.hash)
-		return nil, err
-	}
-
-	// Schedule gossip for this topic
+	// Schedule gossip for this topic so the network learns our allocation.
 	c.gossip.ScheduleUrgent(c, topic)
 
 	return topic, nil
@@ -612,18 +668,177 @@ func (c *Cy) FindTopic(name string) *Topic {
 	return c.topicsByName[name]
 }
 
+// FindOrCreateTopic finds a topic by name or creates it if it does not exist.
+// It mirrors the C cy_find_topic_or_create() entry point.
+func (c *Cy) FindOrCreateTopic(name string, extent int) (*Topic, error) {
+	return c.findOrCreateTopic(name, extent)
+}
+
+// SubjectIDModulus returns the configured subject-ID modulus.
+func (c *Cy) SubjectIDModulus() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.subjectIDModulus
+}
+
+// TopicsBySubjectID returns a snapshot of the live subject-ID -> topic index.
+// Pinned topics are not included (they are not indexed by subject-ID).
+func (c *Cy) TopicsBySubjectID() map[uint32]*Topic {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	snap := make(map[uint32]*Topic, len(c.topicsBySubjectID))
+	for k, v := range c.topicsBySubjectID {
+		snap[k] = v
+	}
+	return snap
+}
+
 // SetSubjectIDModulus sets the subject-ID modulus for the network.
+// The modulus is validated: it must be a prime number congruent to 3 mod 4 and at
+// least SubjectIDModulus16bit, otherwise the quadratic-probing subject-ID
+// function would not cover all residues and fast eviction reconstruction would be
+// impossible. On success the broadcast subject and gossip shard layout are
+// recomputed and the broadcast writer is recreated.
 func (c *Cy) SetSubjectIDModulus(modulus uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Validate modulus
-	if modulus < 1 || modulus > (^uint32(0)-SubjectIDPinnedMax) {
+	if !IsValidSubjectIDModulus(modulus) {
 		return ErrArgument
 	}
 
 	c.subjectIDModulus = modulus
+	c.crdt.SetSubjectIDModulus(modulus)
+	c.broadcastSubjectID = BroadcastSubjectID(modulus)
+	if err := c.initBroadcastSubject(); err != nil {
+		return err
+	}
+	c.gossip.SetShardCount(GossipShardCount(modulus))
 	return nil
+}
+
+// initBroadcastSubject (re)creates the broadcast subject writer used for urgent
+// and periodic broadcast gossips. It mirrors the cy->broad_writer setup in C
+// cy_new(). The previous writer, if any, is destroyed first.
+func (c *Cy) initBroadcastSubject() error {
+	if c.broadWriter != nil {
+		c.platform.DestroySubjectWriter(c.broadWriter)
+		c.broadWriter = nil
+	}
+	// A reader on the broadcast subject is intentionally not created: in this port
+	// the broadcast scope is detected by subject-ID value in handleMulticastMessage,
+	// and the platform delivers by subject-ID regardless.
+	w, err := c.platform.NewSubjectWriter(c.broadcastSubjectID)
+	if err != nil {
+		return err
+	}
+	c.broadWriter = w
+	return nil
+}
+
+// findTopicByHash finds a topic by its hash (write lock not held by caller).
+func (c *Cy) findTopicByHash(hash uint64) *Topic {
+	return c.topicsByHash[hash]
+}
+
+// leftWins is the conflict comparator used only on subject-ID allocation
+// conflicts. Per the model, the OLDER topic wins; ties are broken by the smaller
+// hash. It mirrors C left_wins().
+func (c *Cy) leftWins(left *Topic, now Microsecond, rLage int32, rHash uint64) bool {
+	lLage := left.Lage(now)
+	if lLage != rLage {
+		return lLage > rLage
+	}
+	return left.hash < rHash
+}
+
+// topicAllocate is the consensus reallocation operator. Given a topic and a
+// desired eviction counter, it (re)computes the topic's subject-ID, arbitrates
+// collisions against other local topics, and recursively re-evicts the loser.
+// It mirrors C topic_allocate() and the AllocateTopic(t, topics) TLA+ operator.
+// The caller must hold c.mu.
+func (c *Cy) topicAllocate(topic *Topic, newEvictions uint32, now Microsecond) {
+	modulus := c.subjectIDModulus
+
+	// We cannot mutate the eviction counter while the topic is indexed by subject-ID,
+	// so remove it first. (No-op if it is not currently indexed, e.g. a brand-new topic.)
+	if !topic.pinned {
+		delete(c.topicsBySubjectID, topic.subjectID)
+	}
+
+	// Pinned topics are not indexed by subject-ID (multiple may share one), so there
+	// is no collision to arbitrate; just adopt the eviction counter and re-sync.
+	if isPinned(newEvictions) {
+		if topic.reader != nil {
+			c.platform.DestroySubjectReader(topic.reader)
+			topic.reader = nil
+		}
+		topic.evictions = newEvictions
+		topic.pinned = true
+		topic.subjectID = ^newEvictions
+		c.resyncTopicReader(topic)
+		c.gossip.ScheduleUrgent(c, topic)
+		return
+	}
+
+	newSid := ComputeSubjectID(topic.hash, newEvictions, modulus)
+	that := c.topicsBySubjectID[newSid] // current occupant of the desired subject-ID
+	if that != nil {
+		// A topic can never collide with itself.
+		if that == topic {
+			that = nil
+		}
+	}
+	sameSubject := newSid == topic.subjectID
+	victory := (that == nil) || c.leftWins(topic, now, that.Lage(now), that.hash)
+
+	if victory {
+		// Release the old reader only if we are actually leaving the subject.
+		if !sameSubject && topic.reader != nil && topic.reader.SubjectID() == topic.subjectID {
+			c.platform.DestroySubjectReader(topic.reader)
+			topic.reader = nil
+		}
+		// The loser's transport state is not preserved (Go recreates writers lazily
+		// on send); we just evict it from the index so we can claim the slot.
+		if that != nil {
+			delete(c.topicsBySubjectID, newSid)
+		}
+		topic.evictions = newEvictions
+		topic.pinned = false
+		topic.subjectID = newSid
+		c.topicsBySubjectID[newSid] = topic
+		c.resyncTopicReader(topic)
+		c.gossip.ScheduleUrgent(c, topic)
+
+		// Recursively re-evict the defeated topic onto a new subject-ID.
+		if that != nil {
+			if that.reader != nil {
+				c.platform.DestroySubjectReader(that.reader)
+				that.reader = nil
+			}
+			c.topicAllocate(that, that.evictions+1, now)
+		}
+	} else {
+		// Tail-recurse: re-evict self until it wins a free subject-ID.
+		c.topicAllocate(topic, newEvictions+1, now)
+	}
+}
+
+// resyncTopicReader ensures a subject reader exists for the topic at its current
+// subject-ID. It is a no-op if the reader already matches. The caller must hold
+// c.mu.
+func (c *Cy) resyncTopicReader(topic *Topic) {
+	if topic.reader != nil && topic.reader.SubjectID() == topic.subjectID {
+		return
+	}
+	if topic.reader != nil {
+		c.platform.DestroySubjectReader(topic.reader)
+		topic.reader = nil
+	}
+	r, err := c.platform.NewSubjectReader(topic.subjectID, topic.extent)
+	if err == nil {
+		topic.reader = r
+	}
 }
 
 // hashString computes a hash for a string using rapidhash.

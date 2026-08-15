@@ -23,10 +23,26 @@ type Topic struct {
 	pinnedSubjectID uint32
 
 	// CRDT state for topic allocation
-	// logAge is the log2 of seconds since topic creation.
+	// tsOrigin is the wall-clock approximation of when this topic was first seen
+	// on the network (microseconds). The wire log-age is always derived from it
+	// via log2(now - tsOrigin), mirroring the C topic->ts_origin field. A freshly
+	// created topic has tsOrigin == now, yielding a log-age of LAGEMin (-1).
+	tsOrigin Microsecond
+	// logAge is the cached wire log-age (log2 of seconds since tsOrigin). It is
+	// recomputed from tsOrigin whenever the topic is (re)allocated or merged, and
+	// read for the wire at send time via Lage(now).
 	logAge int32
 	// evictions is the number of times this topic has been evicted and recreated.
 	evictions uint32
+
+	// transport handles managed by the consensus layer on reallocation.
+	reader       SubjectReader
+	readerExtent int
+
+	// gossipCounter counts gossips sent for this topic; the first few (and every
+	// Nth) are broadcast for observability, the rest are sharded. Reset to zero on
+	// urgent (repair) gossip. Mirrors C cy_topic_t.gossip_counter.
+	gossipCounter uint64
 
 	// extent is the maximum message size for this topic.
 	extent int
@@ -54,16 +70,20 @@ func newTopic(name string, modulus uint32) (*Topic, error) {
 		name:    name,
 		hash:    hash,
 		pinned:  pinned,
+		tsOrigin: 0,
 		logAge:  LAGEMin,
-		evictions: 0,
 		extent: 0,
 		refcount: 1,
 	}
 
-	// Assign subject-ID
+	// Assign subject-ID and the pinned eviction encoding. Pinned topics encode
+	// the subject-ID in the eviction counter as UINT32_MAX - subject_id, placing
+	// it in the reserved pinned range [EVICTIONS_PINNED_MIN, UINT32_MAX]; this is
+	// what lets is_pinned() detect them and keeps the hash reflecting the name.
 	if pinned {
 		topic.subjectID = pinnedSubjectID
 		topic.pinnedSubjectID = pinnedSubjectID
+		topic.evictions = ^pinnedSubjectID
 	} else {
 		topic.subjectID = ComputeSubjectID(hash, 0, modulus)
 	}
@@ -105,6 +125,14 @@ func ParsePinnedTopic(name string) (bool, uint32) {
 	}
 
 	return true, uint32(subjectID)
+}
+
+// isPinned reports whether an eviction counter is in the pinned range
+// [EVICTIONS_PINNED_MIN, UINT32_MAX]. A topic is pinned when its eviction counter
+// is in this reserved range; the pinned subject-ID is then UINT32_MAX - evictions.
+// This mirrors the C is_pinned() helper.
+func isPinned(evictions uint32) bool {
+	return evictions >= EVICTIONS_PINNED_MIN
 }
 
 // ComputeSubjectID computes the subject-ID for a topic based on its hash and evictions.
@@ -152,11 +180,6 @@ func (t *Topic) PinnedSubjectID() uint32 {
 	return t.pinnedSubjectID
 }
 
-// LogAge returns the log-age of the topic.
-func (t *Topic) LogAge() int32 {
-	return t.logAge
-}
-
 // Evictions returns the eviction count of the topic.
 func (t *Topic) Evictions() uint32 {
 	return t.evictions
@@ -189,52 +212,56 @@ func (t *Topic) DecRef() {
 	}
 }
 
-// UpdateState updates the topic's CRDT state.
-// This is called when receiving gossip information about the topic.
-func (t *Topic) UpdateState(otherLogAge int32, otherEvictions uint32) bool {
-	// CRDT merge: older log-age wins, ties broken by larger eviction counter
-	if otherLogAge < t.logAge {
-		// Other is older, we win - no change
-		return false
-	} else if otherLogAge > t.logAge {
-		// Other is newer, they win
-		t.logAge = otherLogAge
-		t.evictions = otherEvictions
-		// Recompute subject-ID if not pinned
-		if !t.pinned {
-			// Would need modulus from Cy instance
-			// For now, just mark that an update occurred
-			// t.subjectID = ComputeSubjectID(t.hash, t.evictions, modulus)
-		}
-		return true
-	} else {
-		// Same log-age, larger eviction counter wins
-		if otherEvictions > t.evictions {
-			t.evictions = otherEvictions
-			if !t.pinned {
-				// Would need modulus from Cy instance
-				// For now, just mark that an update occurred
-				// t.subjectID = ComputeSubjectID(t.hash, t.evictions, modulus)
-			}
-			return true
-		}
-		// We win or it's a tie with same or smaller evictions
-		return false
-	}
+// LogAge returns the cached wire log-age of the topic.
+// The authoritative value is derived from tsOrigin via Lage(now); this accessor
+// returns the last cached computation (refreshed on allocation and merge).
+func (t *Topic) LogAge() int32 {
+	return t.logAge
 }
 
-// UpdateStateWithCRDT updates the topic state from CRDT state.
-// This recomputes the subject-ID if the topic is not pinned.
-func (t *Topic) UpdateStateWithCRDT(otherLogAge int32, otherEvictions uint32, crdt *CRDT) bool {
-	// First update the state
-	updated := t.UpdateState(otherLogAge, otherEvictions)
-	
-	if updated && !t.pinned && crdt != nil {
-		// Recompute subject-ID
-		t.subjectID = crdt.ComputeSubjectID(t.hash, t.evictions)
+// Lage computes the current wire log-age from tsOrigin: log2((now - ts_origin)/1s).
+// A freshly created topic (tsOrigin == now) yields LAGEMin. It mirrors C topic_lage().
+func (t *Topic) Lage(now Microsecond) int32 {
+	age := now - t.tsOrigin
+	if age < 0 {
+		age = 0
 	}
-	
-	return updated
+	return int32(Log2Floor(uint64(age) / MEGA))
+}
+
+// SetOriginAt sets tsOrigin and refreshes the cached log-age from an explicit
+// (lage, evictions) pair, mirroring the C topic_lage / topic_new initialization.
+func (t *Topic) SetOriginAt(now Microsecond, lage int32, evictions uint32) {
+	t.evictions = evictions
+	t.tsOrigin = now - LageToUS(int(lage))
+	t.logAge = t.Lage(now)
+}
+
+// MergeLageAt merges a remote log-age into the topic by shifting tsOrigin into
+// the past if the remote topic is older. This is the CRDT merge operator on the
+// log-age, mirroring C topic_merge_lage().
+func (t *Topic) MergeLageAt(now Microsecond, rLage int32) {
+	otherOrigin := now - LageToUS(int(rLage))
+	if otherOrigin < t.tsOrigin {
+		t.tsOrigin = otherOrigin
+	}
+	t.logAge = t.Lage(now)
+}
+
+// UpdateState is the known-topic divergence merge used by the consensus layer.
+// It returns whether the local log-age was refreshed (the merge always pulls the
+// remote age into tsOrigin) and whether the local topic wins arbitration over the
+// remote (older topic wins; ties broken by larger eviction counter). When the
+// local topic loses, the caller is expected to reallocate it to adopt the
+// remote's eviction counter (and therefore its subject-ID), converging both.
+// It mirrors the divergence branch of C on_gossip_known_topic().
+func (t *Topic) UpdateState(now Microsecond, otherLogAge int32, otherEvictions uint32) (merged bool, win bool) {
+	mineLage := t.Lage(now)
+	t.MergeLageAt(now, otherLogAge)
+	if t.evictions != otherEvictions {
+		return true, (mineLage > otherLogAge) || ((mineLage == otherLogAge) && (t.evictions > otherEvictions))
+	}
+	return true, false
 }
 
 // State returns the current CRDT state of the topic.
@@ -248,61 +275,10 @@ func (t *Topic) SetState(logAge int32, evictions uint32) {
 	t.evictions = evictions
 }
 
-// GossipData returns the data to include in gossip messages for this topic.
-// This is the CRDT state that needs to be propagated.
-func (t *Topic) GossipData() []byte {
-	// Format: [hash:8][logAge:4][evictions:4]
-	data := make([]byte, 16)
-	
-	// Write hash (8 bytes, little-endian)
-	for i := 0; i < 8; i++ {
-		data[i] = byte(t.hash >> (i * 8))
-	}
-	
-	// Write logAge (4 bytes, little-endian, signed)
-	for i := 0; i < 4; i++ {
-		data[8+i] = byte(uint32(t.logAge) >> (i * 8))
-	}
-	
-	// Write evictions (4 bytes, little-endian)
-	for i := 0; i < 4; i++ {
-		data[12+i] = byte(t.evictions >> (i * 8))
-	}
-	
-	return data
-}
-
-// ParseGossipData parses gossip data and updates the topic state.
-func (t *Topic) ParseGossipData(data []byte) bool {
-	if len(data) < 16 {
-		return false
-	}
-	
-	// Parse hash
-	var hash uint64
-	for i := 0; i < 8; i++ {
-		hash |= uint64(data[i]) << (i * 8)
-	}
-	
-	// If hash doesn't match, this gossip is for a different topic
-	if hash != t.hash {
-		return false
-	}
-	
-	// Parse logAge
-	var logAge uint32
-	for i := 0; i < 4; i++ {
-		logAge |= uint32(data[8+i]) << (i * 8)
-	}
-	
-	// Parse evictions
-	var evictions uint32
-	for i := 0; i < 4; i++ {
-		evictions |= uint32(data[12+i]) << (i * 8)
-	}
-	
-	// Update state
-	return t.UpdateState(int32(logAge), evictions)
+// GossipName returns the topic name carried in gossip messages so receivers can
+// auto-subscribe unknown topics (C sends the name for this purpose).
+func (t *Topic) GossipName() string {
+	return t.name
 }
 
 // String returns a string representation of the topic.

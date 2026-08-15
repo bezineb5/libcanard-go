@@ -141,6 +141,88 @@ func ExtractHeader(message *Message) (*Header, []byte, error) {
 }
 
 // =====================================================================================================================
+// Gossip wire format.
+//
+// A gossip message is a 24-byte session header followed by the (optional) topic
+// name. The header carries everything needed for CRDT convergence; the trailing
+// name lets a receiver auto-subscribe an unknown topic (Core.tla AcceptGossip and
+// the C cy_on_message header_gossip branch). Layout, matching cy.c send_gossip_raw:
+//
+//	[0]      = header_gossip
+//	[1]      = 0 (reserved)
+//	[2]      = 0 (incompatibility)
+//	[3]      = lage (log-age, signed)
+//	[4:8]    = 0 (incompatibility field, must be zero on the wire)
+//	[8:16]   = hash (u64 LE)
+//	[16:20]  = evictions (u32 LE)
+//	[20:23]  = 0
+//	[23]     = name length (the high byte of the 8-byte [16:24] trailer)
+//	[24:]    = name bytes (name.len)
+//
+// The evictions + name-length are packed into the 8-byte trailer at [16:24] so the
+// standard 24-byte header marshaling is reused: [16:20] = evictions, [23] = name
+// length.
+
+// MarshalGossip builds the 24-byte gossip header (without the trailing name).
+// nameLen is clamped to a single byte as on the wire.
+func MarshalGossip(lage int8, hash, evictions uint64, nameLen int) []byte {
+	buf := make([]byte, HeaderSize)
+	buf[0] = byte(HeaderTypeGossip)
+	buf[1] = 0
+	buf[2] = 0
+	buf[3] = byte(lage)
+	// [4:8] incompatibility stays zero.
+	binary.LittleEndian.PutUint64(buf[8:16], hash)
+	// [16:20] evictions; [20:23] stay zero; [23] carries the name length.
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(evictions))
+	if nameLen > 0 {
+		if nameLen > 255 {
+			nameLen = 255
+		}
+		buf[23] = byte(nameLen)
+	}
+	return buf
+}
+
+// MarshalGossipMessage builds the full wire form: 24-byte header + name bytes.
+func MarshalGossipMessage(lage int8, hash, evictions uint64, name string) []byte {
+	h := MarshalGossip(lage, hash, evictions, len(name))
+	if name != "" {
+		h = append(h, []byte(name)...)
+	}
+	return h
+}
+
+// ParsedGossip is the decoded form of a gossip message.
+type ParsedGossip struct {
+	Lage      int8
+	Hash      uint64
+	Evictions uint32
+	Name      string
+}
+
+// ParseGossipMessage decodes a full gossip wire form (header + name). It returns
+// the name as a string (empty if absent) and validates bounds.
+func ParseGossipMessage(data []byte) (ParsedGossip, error) {
+	if len(data) < HeaderSize {
+		return ParsedGossip{}, ErrArgument
+	}
+	p := ParsedGossip{
+		Lage:      int8(data[3]),
+		Hash:      binary.LittleEndian.Uint64(data[8:16]),
+		Evictions: binary.LittleEndian.Uint32(data[16:20]),
+	}
+	nameLen := int(data[23])
+	if nameLen > 0 {
+		if len(data) < HeaderSize+nameLen {
+			return ParsedGossip{}, ErrArgument
+		}
+		p.Name = string(data[HeaderSize : HeaderSize+nameLen])
+	}
+	return p, nil
+}
+
+// =====================================================================================================================
 // Wire-compatible acknowledgement and response messages.
 //
 // In the C implementation these are carried inside the 24-byte cy_message_header_t:
