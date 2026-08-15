@@ -23,6 +23,18 @@ type RPC struct {
 
 	// streams maps request tags to active streaming sessions.
 	streams map[uint64]*Streaming
+
+	// respondFutures maps a response-ACK key (respondKey) to a pending reliable
+	// response future, mirroring C cy->respond_futures_by_tag. Each reliable
+	// response we transmit awaits a unicast ACK/NACK from the requester.
+	respondFutures map[uint64]*RespondFuture
+}
+
+// respondKey computes the response-ACK correlation key, a faithful port of C respond_key():
+// remote_id ^ message_tag ^ hash ^ (seqno << 16) ^ ((uint64)tag << 56).
+// seqno is the transmitted response stream seqno; tag is the small response header tag byte.
+func respondKey(remoteID, messageTag, hash, seqno uint64, tag byte) uint64 {
+	return remoteID ^ messageTag ^ hash ^ (seqno << 16) ^ (uint64(tag) << 56)
 }
 
 // RequestHandler is a function that handles incoming requests.
@@ -36,8 +48,8 @@ type Responder struct {
 	rpc *RPC
 	// breadcrumb is the origin information of the received request.
 	breadcrumb *Breadcrumb
-	// tag is the request tag.
-	tag uint64
+	// tag is the request tag (used as the small response header byte for reliable responses).
+	tag byte
 	// remoteID is the remote node ID.
 	remoteID uint64
 	// requestID is the request ID.
@@ -58,6 +70,7 @@ func newRPC(cy *Cy) *RPC {
 		nextRequestTag: 0,
 		services:      make(map[uint32]RequestHandler),
 		streams:       make(map[uint64]*Streaming),
+		respondFutures: make(map[uint64]*RespondFuture),
 	}
 }
 
@@ -214,12 +227,11 @@ func (r *RPC) GetService(serviceID uint32) RequestHandler {
 }
 
 // newResponder creates a new responder for a request, capturing the breadcrumb so the
-// response can be correlated (message_tag) and routed back to the correct remote.
 func (r *RPC) newResponder(tag uint64, remoteID uint64, requestID uint32, hash uint64, breadcrumb *Breadcrumb) *Responder {
 	return &Responder{
 		rpc:        r,
 		breadcrumb: breadcrumb,
-		tag:        tag,
+		tag:        byte(tag),
 		remoteID:   remoteID,
 		requestID:  requestID,
 		hash:       hash,
@@ -233,19 +245,20 @@ const responseTimeout = 1000000 // 1 second in microseconds
 
 // sendResponse emits a response (or error response) to the requester over unicast,
 // using the C-compatible response header layout: [0]=type, [1]=tag, [2:8]=seqno(u48),
-// [8:16]=hash, [16:24]=message_tag. The small response tag is taken from the
-// breadcrumb's current seqno low byte; the 48-bit seqno is the breadcrumb seqno.
-func (resp *Responder) sendResponse(reliable bool, data []byte) error {
+// [8:16]=hash, [16:24]=message_tag. For best-effort responses the small tag byte is
+// 0xFF; for reliable responses it is the per-attempt tag (resp.tag). It returns the
+// 48-bit response seqno that was transmitted so the caller can register/correlate.
+func (resp *Responder) sendResponse(reliable bool, data []byte) (uint64, error) {
 	bc := resp.breadcrumb
 	if bc == nil {
-		return ErrArgument
+		return 0, ErrArgument
 	}
 	// Increment the per-request stream seqno (starts at 0 -> first response seqno 0).
 	seqno := bc.IncrementSeqno() - 1
-	// C uses tag 0xFF for best-effort responses and a per-attempt tag for reliable.
+	// C uses tag 0xFF for best-effort responses and the per-attempt tag for reliable.
 	tag := byte(0xFF)
 	if reliable {
-		tag = byte(seqno) // deterministic small tag for reliable retransmission correlation
+		tag = resp.tag
 	}
 	header := MarshalRSPHeader(reliable, tag, seqno, bc.TopicHash, bc.MessageTag)
 	lane := Lane{ID: bc.RemoteID, Priority: bc.Priority}
@@ -253,7 +266,8 @@ func (resp *Responder) sendResponse(reliable bool, data []byte) error {
 	headed := make([]byte, 0, HeaderSize+len(data))
 	headed = append(headed, header...)
 	headed = append(headed, data...)
-	return resp.rpc.cy.platform.Unicast(lane, resp.rpc.cy.Now()+100000, headed)
+	err := resp.rpc.cy.platform.Unicast(lane, resp.rpc.cy.Now()+100000, headed)
+	return seqno, err
 }
 
 // Respond sends a best-effort response to the request described by the breadcrumb.
@@ -262,33 +276,128 @@ func (r *RPC) Respond(breadcrumb *Breadcrumb, seqno uint64, data []byte) error {
 	if seqno != 0 {
 		breadcrumb.Seqno = seqno
 	}
-	return resp.sendResponse(false, data)
+	_, err := resp.sendResponse(false, data)
+	return err
 }
 
-// RespondReliable sends a reliable response to the request described by the breadcrumb.
-// It returns a future that completes when the response has been transmitted.
-func (r *RPC) RespondReliable(breadcrumb *Breadcrumb, seqno uint64, data []byte) *PublicationFuture {
+// RespondReliable sends a reliable response and returns a RespondFuture that completes
+// with OK when the requester ACKs it, or ErrNACK/ErrDelivery on NACK/timeout. The
+// response is retransmitted until acknowledged or the ack-timeout elapses, mirroring
+// C cy_respond_reliable + respond_future.
+func (r *RPC) RespondReliable(breadcrumb *Breadcrumb, seqno uint64, data []byte) *RespondFuture {
 	resp := r.newResponder(0, breadcrumb.RemoteID, 0, breadcrumb.TopicHash, breadcrumb)
-	if seqno != 0 {
-		breadcrumb.Seqno = seqno
-	}
 	return resp.sendResponseReliable(data)
 }
 
-// sendResponseReliable emits the reliable response and wraps the send result in a future.
-func (resp *Responder) sendResponseReliable(data []byte) *PublicationFuture {
-	f := NewPublicationFuture(0, 1)
-	var e Error = OK
-	if err := resp.sendResponse(true, data); err != nil {
-		e = ErrArgument
+// sendResponseReliable transmits a reliable response, registers a RespondFuture keyed by
+// respondKey(remoteID, messageTag, hash, seqno, tag), and arms the retransmission timer.
+func (resp *Responder) sendResponseReliable(data []byte) *RespondFuture {
+	bc := resp.breadcrumb
+	if bc == nil {
+		return nil
 	}
-	f.complete(e)
-	return f
+	seqno, err := resp.sendResponse(true, data)
+	if err != nil {
+		return nil
+	}
+	fut := &RespondFuture{
+		rpc:        resp.rpc,
+		breadcrumb: bc,
+		tag:        resp.tag,
+		seqno:      seqno,
+		hash:       bc.TopicHash,
+		data:       append([]byte(nil), data...),
+		priority:   bc.Priority,
+		ctx:        bc.UnicastCtx,
+		ackTimeout: ResponseACKTimeoutMicrosecond,
+	}
+	// Pick a small tag that yields a unique key; tag 0..0xFF (C loops the same way).
+	r := resp.rpc
+	r.mu.Lock()
+	for {
+		key := respondKey(bc.RemoteID, bc.MessageTag, bc.TopicHash, seqno, resp.tag)
+		if _, exists := r.respondFutures[key]; !exists {
+			r.respondFutures[key] = fut
+			break
+		}
+		if resp.tag == 0xFF {
+			break // exhaustion: keep the colliding entry (practically unreachable)
+		}
+		resp.tag++
+	}
+	r.mu.Unlock()
+	// Retransmit until acknowledged or timed out.
+	fut.armRetransmit()
+	return fut
 }
 
-// Send sends a best-effort response to the original requester.
+// armRetransmit schedules a retransmission of this response after ackTimeout, faithful
+// to C's respond_future_timeout loop. Each retransmission reuses the same seqno/tag so
+// the requester's ACK continues to correlate.
+func (f *RespondFuture) armRetransmit() {
+	if f.breadcrumb == nil {
+		return
+	}
+	f.retransmit = f.rpc.cy.olga.Schedule(int64(f.rpc.cy.Now()+f.ackTimeout), func() {
+		f.onRetransmitTick()
+	})
+}
+
+// onRetransmitTick re-sends the response if still pending; otherwise stops.
+func (f *RespondFuture) onRetransmitTick() {
+	f.mu.Lock()
+	if f.done {
+		f.mu.Unlock()
+		return
+	}
+	// Snapshot send parameters under lock.
+	bc := f.breadcrumb
+	seqno := f.seqno
+	tag := f.tag
+	hash := f.hash
+	data := append([]byte(nil), f.data...)
+	prio := f.priority
+	ctx := f.ctx
+	f.mu.Unlock()
+
+	if bc == nil {
+		return
+	}
+	header := MarshalRSPHeader(true, tag, seqno, hash, bc.MessageTag)
+	lane := Lane{ID: bc.RemoteID, Priority: prio}
+	copy(lane.Context[:], ctx[:])
+	headed := make([]byte, 0, HeaderSize+len(data))
+	headed = append(headed, header...)
+	headed = append(headed, data...)
+	_ = f.rpc.cy.platform.Unicast(lane, f.rpc.cy.Now()+100000, headed)
+
+	// Re-arm. C keeps retransmitting until acked or the deadline is reached; here the
+	// ack-timeout window doubles as the retransmit interval and total lifetime.
+	f.armRetransmit()
+}
+
+// remove unregisters the future from the index (idempotent).
+func (f *RespondFuture) remove() {
+	f.rpc.mu.Lock()
+	key := respondKey(f.breadcrumb.RemoteID, f.breadcrumb.MessageTag, f.hash, f.seqno, f.tag)
+	if f.rpc.respondFutures[key] == f {
+		delete(f.rpc.respondFutures, key)
+	}
+	f.rpc.mu.Unlock()
+}
+// sendResponseAck emits a unicast response ACK/NACK back to the responder for a reliable
+// response we just received. Faithful port of C send_response_ack: header[0]=type,
+// [1]=tag, [2:8]=seqno(u48), [8:16]=hash, [16:24]=message_tag. positive selects ACK/NACK.
+func (r *RPC) sendResponseAck(lane Lane, messageTag, seqno uint64, tag byte, hash uint64, positive bool) {
+	header := MarshalRSPACKHeader(positive, tag, seqno, hash, messageTag)
+	reply := Lane{ID: lane.ID, Priority: lane.Priority}
+	copy(reply.Context[:], lane.Context[:])
+	_ = r.cy.platform.Unicast(reply, r.cy.Now()+ResponseACKTimeoutMicrosecond, header)
+}
+
 func (resp *Responder) Send(data []byte) error {
-	return resp.sendResponse(false, data)
+	_, err := resp.sendResponse(false, data)
+	return err
 }
 
 // SendError sends an error response to the original requester. The error code is
@@ -298,17 +407,18 @@ func (resp *Responder) SendError(errorCode uint8, data []byte) error {
 	body := make([]byte, 0, 1+len(data))
 	body = append(body, errorCode)
 	body = append(body, data...)
-	return resp.sendResponse(false, body)
+	_, err := resp.sendResponse(false, body)
+	return err
 }
 
 // StartStream starts a streaming response.
 func (resp *Responder) StartStream() *Streaming {
-	stream := newStreaming(resp.tag, resp.remoteID)
+	stream := newStreaming(uint64(resp.tag), resp.remoteID)
 
 	resp.rpc.mu.Lock()
 	defer resp.rpc.mu.Unlock()
 
-	resp.rpc.streams[resp.tag] = stream
+	resp.rpc.streams[uint64(resp.tag)] = stream
 
 	return stream
 }

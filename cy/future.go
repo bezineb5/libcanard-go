@@ -2,6 +2,8 @@ package cy
 
 import (
 	"sync"
+
+	"github.com/opencyphal/cy-go/olga"
 )
 
 // Future represents an asynchronous operation that will complete later.
@@ -266,11 +268,77 @@ func (f *PublicationFuture) Nack() {
 	f.updateError(ErrNACK)
 }
 
+// from the requester. Faithful port of C respond_future_t: it is keyed by respondKey
+// (remoteID, messageTag, hash, seqno, tag) and retransmits the response until the
+// requester ACKs or the ack-timeout elapses.
+type RespondFuture struct {
+	futureBase
+
+	// rpc is the owning RPC manager (used for map removal and retransmit scheduling).
+	rpc *RPC
+
+	// breadcrumb is the response origin; its RemoteID/MessageTag/TopicHash/Seqno/UnicastCtx
+	// are the correlation fields matched against the incoming response-ACK.
+	breadcrumb *Breadcrumb
+
+	// tag is the small response header byte (the per-attempt tag) used in the key.
+	tag byte
+
+	// seqno is the response stream seqno that was transmitted.
+	seqno uint64
+
+	// hash is the service/topic hash transmitted in the response header.
+	hash uint64
+
+	// data is the response payload; retained for retransmission.
+	data []byte
+
+	// priority is the lane priority used when transmitting/retransmitting.
+	priority Priority
+
+	// ctx is the transport context carried in the lane when transmitting/retransmitting.
+	ctx [24]byte
+
+	// ackTimeout is the interval between retransmissions / total lifetime.
+	ackTimeout Microsecond
+
+	// retransmit is the scheduled retransmission task; nil when not pending.
+	retransmit *olga.Task
+}
+
+// onAck is invoked when the requester ACKs (positive) or NACKs (negative) this response.
+// Faithful port of C respond_future_on_ack: stop retransmitting, remove from the index,
+// set the error, and complete.
+func (f *RespondFuture) onAck(positive bool) {
+	f.mu.Lock()
+	if f.done {
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+
+	// Stop retransmissions and unregister before completing.
+	if f.retransmit != nil {
+		f.rpc.cy.olga.Cancel(f.retransmit)
+		f.retransmit = nil
+	}
+	f.remove()
+
+	var e Error = OK
+	if !positive {
+		e = ErrNACK
+	}
+	f.complete(e)
+}
+
+// ResponseACKTimeoutMicrosecond is the response-ACK retransmission/timeout window,
+// mirroring C ACK_TX_TIMEOUT (1,000,000 us = 1 second).
+const ResponseACKTimeoutMicrosecond = 1000000
 // RequestFuture is a future for request operations.
 // It represents a request that is waiting for responses.
 type RequestFuture struct {
 	futureBase
-	
+
 	// tag is the message tag for this request.
 	tag uint64
 	

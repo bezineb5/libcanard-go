@@ -253,3 +253,124 @@ func TestResponderWireFormat(t *testing.T) {
 		t.Errorf("second response seqno mismatch: got %d want 1", parsed2.Seqno)
 	}
 }
+
+// TestRespondReliableHandshake drives the full reliable-response ACK handshake faithfully:
+//  1. Responder calls RespondReliable -> emits a reliable response (header_rsp_rel) on its platform.
+//  2. Requester ingests that response via HandleMessage -> emits a response ACK (header_rsp_ack).
+//  3. Responder ingests that ACK via HandleMessage -> its RespondFuture completes with OK.
+//
+// It also asserts the negative case: a response NACK completes the future with ErrNACK.
+func TestRespondReliableHandshake(t *testing.T) {
+	const (
+		remoteID  = uint64(42)
+		topicHash = uint64(0x0F0E0D0C0B0A0908)
+	)
+
+	responderPlat := NewMockPlatform()
+	responder, err := cy.New(responderPlat, "responder", "", "")
+	if err != nil {
+		t.Fatalf("responder New: %v", err)
+	}
+	defer responder.Destroy()
+
+	requesterPlat := NewMockPlatform()
+	requester, err := cy.New(requesterPlat, "requester", "", "")
+	if err != nil {
+		t.Fatalf("requester New: %v", err)
+	}
+	defer requester.Destroy()
+
+	// The requester must have a live request future whose tag equals the response's
+	// message_tag, otherwise (faithful to C) it answers a reliable response with NACK.
+	reqPub, err := requester.Advertise("test.service")
+	if err != nil {
+		t.Fatalf("requester Advertise: %v", err)
+	}
+	defer reqPub.Destroy()
+	reqFuture := requester.RPC().Request(reqPub, requester.Now()+1000000, 1000000, []byte{0xAB})
+	if reqFuture == nil {
+		t.Fatal("Request returned nil")
+	}
+	messageTag := reqFuture.Tag()
+
+	bc := cy.NewBreadcrumb(responder, cy.PriorityNominal, remoteID, topicHash, messageTag)
+	payload := []byte{0xCA, 0xFE}
+	fut := responder.RPC().RespondReliable(bc, 0, payload)
+	if fut == nil {
+		t.Fatal("RespondReliable returned nil future")
+	}
+
+	// Step 1: responder emitted exactly one reliable response.
+	if len(responderPlat.ReceivedMessages) != 1 {
+		t.Fatalf("expected 1 message from responder, got %d", len(responderPlat.ReceivedMessages))
+	}
+	respWire := responderPlat.ReceivedMessages[0].Data
+	parsed, perr := cy.ParseResponseHeader(respWire)
+	if perr != nil {
+		t.Fatalf("ParseResponseHeader: %v", perr)
+	}
+	if !parsed.Reliable {
+		t.Fatalf("expected reliable response header")
+	}
+	if parsed.Hash != topicHash || parsed.MessageTag != messageTag {
+		t.Fatalf("response hash/message_tag mismatch")
+	}
+	if parsed.Tag != byte(parsed.Seqno) {
+		t.Fatalf("reliable response tag must equal seqno low byte (got %#x want %#x)", parsed.Tag, byte(parsed.Seqno))
+	}
+
+	// Step 2: requester ingests the response -> emits a response ACK back to the responder.
+	reqMsgTS := cy.NewMessageTS(cy.Microsecond(1000), cy.NewMessage(append([]byte(nil), respWire...)))
+	reqLane := cy.Lane{ID: remoteID} // lane.ID is the responder (source of the response).
+	requester.HandleMessage(reqLane, nil, *reqMsgTS)
+
+	if len(requesterPlat.ReceivedMessages) != 1 {
+		t.Fatalf("expected 1 ACK from requester, got %d", len(requesterPlat.ReceivedMessages))
+	}
+	ackWire := requesterPlat.ReceivedMessages[0].Data
+	ackParsed, aerr := cy.ParseResponseHeader(ackWire)
+	if aerr != nil {
+		t.Fatalf("ParseResponseHeader(ack): %v", aerr)
+	}
+	if ackParsed.Type != cy.HeaderTypeRspAck {
+		t.Fatalf("expected response ACK, got type %d", ackParsed.Type)
+	}
+	// The ACK must echo the response's correlation fields so the responder can match it.
+	if ackParsed.MessageTag != messageTag || ackParsed.Seqno != parsed.Seqno || ackParsed.Tag != parsed.Tag || ackParsed.Hash != topicHash {
+		t.Fatalf("ACK correlation mismatch: %+v vs response %+v", ackParsed, parsed)
+	}
+	if ackWire[1] != parsed.Tag {
+		t.Fatalf("ACK small tag must equal response tag")
+	}
+
+	// Step 3: responder ingests the ACK -> its RespondFuture completes with OK.
+	respMsgTS := cy.NewMessageTS(cy.Microsecond(2000), cy.NewMessage(append([]byte(nil), ackWire...)))
+	respLane := cy.Lane{ID: remoteID} // ACK source = requester node ID (the responder's RemoteID target).
+	responder.HandleMessage(respLane, nil, *respMsgTS)
+
+	if !fut.Done() {
+		t.Fatalf("RespondFuture should be done after ACK")
+	}
+	if fut.Error() != cy.OK {
+		t.Fatalf("RespondFuture error: %v, want OK", fut.Error())
+	}
+
+	// Negative case: a fresh reliable response NACK'd completes with ErrNACK.
+	bc2 := cy.NewBreadcrumb(responder, cy.PriorityNominal, 43, topicHash, messageTag+1)
+	fut2 := responder.RPC().RespondReliable(bc2, 0, []byte{0x01})
+	if len(responderPlat.ReceivedMessages) != 2 {
+		t.Fatalf("expected a second response from responder, got %d", len(responderPlat.ReceivedMessages))
+	}
+	respWire2 := responderPlat.ReceivedMessages[1].Data
+	parsed2, _ := cy.ParseResponseHeader(respWire2)
+	// Build a NACK with identical correlation fields.
+	nack := cy.MarshalRSPACKHeader(false, parsed2.Tag, parsed2.Seqno, parsed2.Hash, parsed2.MessageTag)
+	nackTS := cy.NewMessageTS(cy.Microsecond(3000), cy.NewMessage(nack))
+	responder.HandleMessage(cy.Lane{ID: 43}, nil, *nackTS)
+	if !fut2.Done() {
+		t.Fatalf("second RespondFuture should be done after NACK")
+	}
+	if fut2.Error() != cy.ErrNACK {
+		t.Fatalf("second RespondFuture error: %v, want ErrNACK", fut2.Error())
+	}
+}

@@ -340,6 +340,11 @@ func (c *Cy) handleUnicastMessage(lane Lane, message MessageTS) {
 // The 24-byte response header carries [1]=tag, [2:8]=seqno(u48), [8:16]=hash,
 // [16:24]=message_tag. The message_tag is the correlation with the original request;
 // seqno is the response stream sequence number.
+// handleResponseMessage handles an incoming response (C header_rsp_be/rel).
+// The 24-byte response header carries [1]=tag, [2:8]=seqno(u48), [8:16]=hash,
+// [16:24]=message_tag. The message_tag is the correlation with the original request;
+// seqno is the response stream sequence number. For a reliable response we answer with a
+// response ACK/NACK (C send_response_ack), mirroring the requester side of the handshake.
 func (c *Cy) handleResponseMessage(lane Lane, hdr [HeaderSize]byte, message MessageTS) {
 	if message.Content == nil {
 		return
@@ -354,6 +359,21 @@ func (c *Cy) handleResponseMessage(lane Lane, hdr [HeaderSize]byte, message Mess
 		Timestamp: c.Now(),
 		Message:   &message,
 	})
+	// Faithful port of C header_rsp_rel branch: a reliable response is answered with a
+	// response ACK (if a live request future awaits it) or NACK (orphaned/unknown).
+	if parsed.Reliable {
+		positive := c.rpc.hasLiveRequest(parsed.MessageTag)
+		c.rpc.sendResponseAck(lane, parsed.MessageTag, parsed.Seqno, parsed.Tag, parsed.Hash, positive)
+	}
+}
+
+// hasLiveRequest reports whether a pending RequestFuture exists for the given message tag,
+// matching C's topic->request_futures_by_tag lookup before deciding ACK vs NACK.
+func (r *RPC) hasLiveRequest(messageTag uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.requests[messageTag]
+	return ok
 }
 
 // handleACKMessage handles an incoming message ACK/NACK (C header_msg_ack/nack).
@@ -367,9 +387,35 @@ func (c *Cy) handleACKMessage(lane Lane, tag uint64) {
 	}
 }
 
-// handleResponseAckMessage handles a response ACK/NACK (C header_rsp_ack/nack).
+// handleResponseAckMessage handles an incoming response ACK/NACK (C header_rsp_ack/nack).
+// Faithful port of the C header_rsp_ack/rsp_nack branch: look up the pending reliable
+// response by respondKey(lane.id, message_tag, hash, seqno, tag) and, on a full match of
+// the breadcrumb correlation fields, complete it (ACK -> OK, NACK -> ErrNACK). Unknown
+// ACKs (duplicate or orphaned) are ignored, matching C's orphan-ACK trace path.
 func (c *Cy) handleResponseAckMessage(lane Lane, hdr [HeaderSize]byte, message MessageTS) {
-	// Placeholder: response ACK correlation is handled at the RPC layer.
+	parsed, err := ParseResponseHeader(hdr[:])
+	if err != nil {
+		return
+	}
+	positive := parsed.Type == HeaderTypeRspAck
+	r := c.rpc
+	key := respondKey(lane.ID, parsed.MessageTag, parsed.Hash, parsed.Seqno, parsed.Tag)
+	r.mu.RLock()
+	fut, ok := r.respondFutures[key]
+	r.mu.RUnlock()
+	if !ok {
+		return // duplicate or orphaned ACK; nothing pending.
+	}
+	// Full match check to guard against key collisions (mirrors C's match guard).
+	if fut.breadcrumb == nil ||
+		fut.breadcrumb.RemoteID != lane.ID ||
+		fut.breadcrumb.MessageTag != parsed.MessageTag ||
+		fut.hash != parsed.Hash ||
+		fut.seqno != parsed.Seqno ||
+		fut.tag != parsed.Tag {
+		return
+	}
+	fut.onAck(positive)
 }
 
 
