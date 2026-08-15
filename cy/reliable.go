@@ -2,7 +2,29 @@ package cy
 
 import (
 	"sync"
+
+	"github.com/opencyphal/cy-go/olga"
 )
+
+// Reliable-delivery constants, faithful to cy.c.
+const (
+	// sessionCounterMaxBackwardLag is the maximum number of tags a sequence may
+	// move backwards (wrapping) before it is treated as a restart and forces a
+	// resequence. Mirrors C SESSION_COUNTER_MAX_BACKWARD_LAG.
+	sessionCounterMaxBackwardLag = uint64(100000)
+	// reorderingCapacity bounds the per-(remote,topic) reordering window.
+	reorderingCapacity = 16
+	// dedupHistory is the size (in bits) of the per-remote reliable-dedup sliding
+	// bitmap. Must be a multiple of 64. Mirrors C DEDUP_HISTORY.
+	dedupHistory = 512
+	// int64Max is the largest representable int64, used to detect wrapped-around
+	// (negative) linearized tags. Mirrors C INT64_MAX.
+	int64Max = uint64(9223372036854775807)
+)
+
+// ===========================================================================
+// Reliable message (publisher-side) delivery with ACK/NACK and retransmission.
+// ===========================================================================
 
 // ReliableDelivery manages reliable message delivery for publishers.
 // It tracks associations (remote subscribers) and handles ACK/NACK messages.
@@ -327,4 +349,325 @@ func (rd *ReliableDelivery) Cleanup(now Microsecond) {
 			delete(rd.associations, remoteID)
 		}
 	}
+}
+
+// ===========================================================================
+// Reliable-message deduplication to mitigate ACK loss (subscriber side).
+//
+// An instance is kept per remote node that publishes reliable messages on a given
+// topic. It is a sliding window of the most recently received message tags
+// (relative to the last accepted tag), used to suppress duplicate deliveries that
+// occur when an acknowledgement is lost. Faithful port of C dedup_t.
+// ===========================================================================
+
+// dedupState is the per-remote sliding bitmap of accepted reliable tags.
+type dedupState struct {
+	remoteID     uint64
+	tag          uint64 // Most recent (frontier) accepted tag.
+	lastActiveAt Microsecond
+	bitmap       [dedupHistory / 64]uint64
+}
+
+// check reports whether tag was already accepted within the current window.
+func (d *dedupState) check(tag uint64) bool {
+	rev := d.tag - tag
+	if rev < dedupHistory {
+		return (d.bitmap[rev/64] & (1 << (rev % 64))) != 0
+	}
+	return false
+}
+
+// commit records tag as accepted, shifting the window forward if needed.
+func (d *dedupState) commit(tag uint64) {
+	rev := d.tag - tag
+	if rev < dedupHistory {
+		d.bitmap[rev/64] |= 1 << (rev % 64)
+		return
+	}
+	fwd := tag - d.tag
+	if fwd >= dedupHistory {
+		// The new tag is far ahead: the entire window is obsolete.
+		d.bitmap = [dedupHistory / 64]uint64{}
+	} else {
+		bitmapShift(d.bitmap[:], dedupHistory, int64(fwd))
+	}
+	d.tag = tag
+	d.bitmap[0] |= 1
+}
+
+// bitmapShift shifts a bitmap of bitCount bits by shiftAmount positions. A
+// positive shift moves bits toward higher indices (dropping the lowest), a
+// negative shift moves them toward lower indices. Faithful port of C bitmap_shift.
+func bitmapShift(bitmap []uint64, bitCount int, shiftAmount int64) {
+	if len(bitmap) == 0 || bitCount <= 0 || shiftAmount == 0 {
+		return
+	}
+	words := (bitCount + 63) / 64
+	tail := bitCount % 64
+	if tail > 0 {
+		bitmap[words-1] &= (1 << uint(tail)) - 1
+	}
+	var shiftMag uint64
+	if shiftAmount >= 0 {
+		shiftMag = uint64(shiftAmount)
+	} else {
+		shiftMag = uint64(-(shiftAmount + 1)) + 1
+	}
+	if shiftMag >= uint64(bitCount) {
+		for i := 0; i < words; i++ {
+			bitmap[i] = 0
+		}
+		return
+	}
+	wholeWords := int(shiftMag / 64)
+	partBits := int(shiftMag % 64)
+	if shiftAmount > 0 { // Left shift.
+		if wholeWords > 0 {
+			for i := words - 1; i >= 0; i-- {
+				if i >= wholeWords {
+					bitmap[i] = bitmap[i-wholeWords]
+				} else {
+					bitmap[i] = 0
+				}
+			}
+		}
+		if partBits > 0 {
+			for i := words - 1; i >= 0; i-- {
+				carry := uint64(0)
+				if i > 0 {
+					carry = bitmap[i-1] >> uint(64-partBits)
+				}
+				bitmap[i] = (bitmap[i] << uint(partBits)) | carry
+			}
+		}
+	} else { // Right shift.
+		if wholeWords > 0 {
+			for i := 0; i < words; i++ {
+				if i+wholeWords < words {
+					bitmap[i] = bitmap[i+wholeWords]
+				} else {
+					bitmap[i] = 0
+				}
+			}
+		}
+		if partBits > 0 {
+			for i := 0; i < words; i++ {
+				carry := uint64(0)
+				if i+1 < words {
+					carry = bitmap[i+1] << uint(64-partBits)
+				}
+				bitmap[i] = (bitmap[i] >> uint(partBits)) | carry
+			}
+		}
+	}
+	if tail > 0 {
+		bitmap[words-1] &= (1 << uint(tail)) - 1
+	}
+}
+
+// ===========================================================================
+// Message reordering for ordered subscribers.
+//
+// One reorderingState is used per (remote node & topic) per subscription, to
+// enforce strictly-increasing order of message tags (modulo 2**64) from each
+// remote. Missing messages are waited for for up to the reordering window, after
+// which the gap is closed by advancing the expected tag; late arrivals are then
+// dropped. Faithful port of C reordering_t / reordering_slot_t.
+// ===========================================================================
+
+// reorderingKey identifies a reordering instance by (remote node, topic hash).
+type reorderingKey struct {
+	remoteID  uint64
+	topicHash uint64
+}
+
+// reorderingSlot is an interned (not-yet-ejected) message pending in-order delivery.
+type reorderingSlot struct {
+	linTag   uint64
+	priority Priority
+	message  MessageTS
+}
+
+// reorderingState is a per-(remote,topic) in-order delivery buffer.
+type reorderingState struct {
+	subscriber *Subscriber
+	remoteID   uint64
+	topicHash  uint64
+	unicastCtx [24]byte
+
+	tagBaseline       uint64 // First seen tag; subtract from incoming tags for linearization.
+	lastEjectedLinTag uint64 // Linearized tag last delivered to the application.
+	slots             map[uint64]*reorderingSlot
+	windowTask        *olga.Task
+	lastActiveAt      Microsecond
+}
+
+// resequence resets the window baseline around tag so that tag maps to the
+// middle of the window. Used when the sequence appears to have restarted.
+func (r *reorderingState) resequence(tag uint64) {
+	r.tagBaseline = tag - (reorderingCapacity / 2)
+	r.lastEjectedLinTag = 0
+}
+
+// minSlot returns the interned slot with the smallest linearized tag (or nil).
+func (r *reorderingState) minSlot() *reorderingSlot {
+	var best *reorderingSlot
+	for _, s := range r.slots {
+		if best == nil || s.linTag < best.linTag {
+			best = s
+		}
+	}
+	return best
+}
+
+// eject delivers a single interned slot in order and advances the window.
+func (r *reorderingState) eject(slot *reorderingSlot) {
+	delete(r.slots, slot.linTag)
+	r.lastEjectedLinTag = slot.linTag
+	arrival := &Arrival{
+		Message: slot.message,
+		Breadcrumb: Breadcrumb{
+			Cy:         r.subscriber.cy,
+			Priority:   slot.priority,
+			RemoteID:   r.remoteID,
+			TopicHash:  r.topicHash,
+			MessageTag: slot.linTag + r.tagBaseline,
+			UnicastCtx: r.unicastCtx,
+		},
+	}
+	r.subscriber.notify(arrival)
+}
+
+// scan ejects in-order messages. When forceFirst is true, it also force-ejects
+// the head slot even if a gap remains (used on window expiration). It keeps the
+// window timer armed against the current head-of-line slot.
+func (r *reorderingState) scan(forceFirst bool) {
+	for {
+		slot := r.minSlot()
+		if slot == nil {
+			if r.windowTask != nil {
+				r.subscriber.cy.olga.Cancel(r.windowTask)
+				r.windowTask = nil
+			}
+			break
+		}
+		if forceFirst || slot.linTag == r.lastEjectedLinTag+1 {
+			forceFirst = false
+			r.eject(slot)
+		} else {
+			deadline := int64(slot.message.Timestamp + r.subscriber.reorderingWindow)
+			if r.windowTask != nil {
+				r.subscriber.cy.olga.Cancel(r.windowTask)
+			}
+			r.windowTask = r.subscriber.cy.olga.Schedule(deadline, r.onWindowExpiration)
+			break
+		}
+	}
+}
+
+// onWindowExpiration is invoked when the reordering window for the head-of-line
+// gap closes: force-eject whatever is pending so late gaps do not stall delivery.
+func (r *reorderingState) onWindowExpiration() {
+	r.scan(true)
+}
+
+// push decides whether message (for the given tag) can be ejected now or must be
+// interned. It returns true if the message is accepted (ejected or interned) and
+// should be acknowledged; false if it is a late drop and must not be acknowledged.
+func (r *reorderingState) push(tag uint64, priority Priority, message MessageTS) bool {
+	linTag := tag - r.tagBaseline
+
+	// Late arrival or duplicate: the gap is already closed, cannot accept.
+	if linTag <= r.lastEjectedLinTag {
+		return false
+	}
+
+	// Negative (wrapped) linearized tag => the sequence moved backwards.
+	if linTag > int64Max {
+		backwardDistance := r.lastEjectedLinTag - linTag // wrapping subtraction.
+		if backwardDistance <= sessionCounterMaxBackwardLag {
+			return false
+		}
+		r.ejectAll(false)
+		r.resequence(tag)
+		linTag = tag - r.tagBaseline
+	}
+
+	// If too far ahead, force-eject old messages to slide the window right.
+	for len(r.slots) > 0 && linTag > (r.lastEjectedLinTag+reorderingCapacity) {
+		r.scan(true)
+	}
+	if r.subscriber.disposed {
+		return false
+	}
+
+	// The next expected message: eject immediately (fast path).
+	if linTag == r.lastEjectedLinTag+1 {
+		r.lastEjectedLinTag = linTag
+		delivered := r.subscriber.notify(&Arrival{
+			Message: message,
+			Breadcrumb: Breadcrumb{
+				Cy:         r.subscriber.cy,
+				Priority:   priority,
+				RemoteID:   r.remoteID,
+				TopicHash:  r.topicHash,
+				MessageTag: tag,
+				UnicastCtx: r.unicastCtx,
+			},
+		})
+		r.scan(false)
+		return delivered
+	}
+
+	// Still too far ahead: treat as a restart and resequence.
+	if linTag > (r.lastEjectedLinTag + reorderingCapacity) {
+		r.resequence(tag)
+		linTag = tag - r.tagBaseline
+	}
+
+	// Intern the message within the reordering window.
+	if _, exists := r.slots[linTag]; exists {
+		// Already interned with this tag: a duplicate. Accept for reliability
+		// semantics (idempotent drop for the application).
+		return true
+	}
+	r.slots[linTag] = &reorderingSlot{
+		linTag:   linTag,
+		priority: priority,
+		message:  message,
+	}
+	// Re-arm the window timer against the new head-of-line slot.
+	if first := r.minSlot(); first != nil {
+		deadline := int64(first.message.Timestamp + r.subscriber.reorderingWindow)
+		if r.windowTask != nil {
+			r.subscriber.cy.olga.Cancel(r.windowTask)
+		}
+		r.windowTask = r.subscriber.cy.olga.Schedule(deadline, r.onWindowExpiration)
+	}
+	return true
+}
+
+// ejectAll delivers (or silences) every interned message and leaves the state idle.
+func (r *reorderingState) ejectAll(silenced bool) {
+	for len(r.slots) > 0 {
+		slot := r.minSlot()
+		if slot == nil {
+			break
+		}
+		if silenced {
+			delete(r.slots, slot.linTag)
+		} else {
+			r.eject(slot)
+		}
+	}
+	if r.windowTask != nil {
+		r.subscriber.cy.olga.Cancel(r.windowTask)
+		r.windowTask = nil
+	}
+}
+
+// destroy tears down the reordering state, optionally silenced.
+func (r *reorderingState) destroy(silenced bool) {
+	r.ejectAll(silenced)
+	r.subscriber.removeReordering(reorderingKey{r.remoteID, r.topicHash})
 }

@@ -49,6 +49,10 @@ type Topic struct {
 
 	// refcount is the number of references to this topic.
 	refcount int
+
+	// dedup holds per-remote reliable-deduplication state. It is only consulted
+	// for reliable (MsgRel) transfers, where ACK loss can cause duplicates.
+	dedup map[uint64]*dedupState
 }
 
 // newTopic creates a new topic with the specified name. The name is expected to be
@@ -76,6 +80,7 @@ func newTopic(name string, modulus uint32, pin uint16) (*Topic, error) {
 		logAge:   LAGEMin,
 		extent:   0,
 		refcount: 1,
+		dedup:    make(map[uint64]*dedupState),
 	}
 
 	// Pinned topics encode the subject-ID in the eviction counter as
@@ -280,10 +285,54 @@ func (t *Topic) SetState(logAge int32, evictions uint32) {
 	t.evictions = evictions
 }
 
-// GossipName returns the topic name carried in gossip messages so receivers can
+	// GossipName returns the topic name carried in gossip messages so receivers can
 // auto-subscribe unknown topics (C sends the name for this purpose).
 func (t *Topic) GossipName() string {
 	return t.name
+}
+
+// ---------------------------------------------------------------------------
+// Reliable-message deduplication (per remote node).
+// ---------------------------------------------------------------------------
+
+// dedupFind returns the per-remote dedup state, dropping it first if stale.
+func (t *Topic) dedupFind(remoteID uint64, now Microsecond) *dedupState {
+	d, ok := t.dedup[remoteID]
+	if !ok {
+		return nil
+	}
+	if now-d.lastActiveAt > SessionLifetime {
+		delete(t.dedup, remoteID)
+		return nil
+	}
+	return d
+}
+
+// dedupFindOrCreate returns the per-remote dedup state, creating it if missing
+// or stale. The new state's frontier tag is set to tag.
+func (t *Topic) dedupFindOrCreate(remoteID, tag uint64, now Microsecond) *dedupState {
+	if d := t.dedupFind(remoteID, now); d != nil {
+		return d
+	}
+	d := &dedupState{remoteID: remoteID, tag: tag, lastActiveAt: now}
+	t.dedup[remoteID] = d
+	return d
+}
+
+// dedupCheck reports whether tag was already accepted from remoteID.
+func (t *Topic) dedupCheck(remoteID, tag uint64, now Microsecond) bool {
+	d := t.dedupFind(remoteID, now)
+	if d == nil {
+		return false
+	}
+	return d.check(tag)
+}
+
+// dedupCommit records tag as accepted from remoteID (creating state if needed).
+func (t *Topic) dedupCommit(remoteID, tag uint64, now Microsecond) {
+	d := t.dedupFindOrCreate(remoteID, tag, now)
+	d.commit(tag)
+	d.lastActiveAt = now
 }
 
 // String returns a string representation of the topic.

@@ -96,65 +96,54 @@ func MatchPattern(pattern, topic string) (bool, []string) {
 	return MatchSegments(patternSegs, topicSegs)
 }
 
-// MatchSegments matches pattern segments against topic segments.
+// MatchSegments matches pattern segments against topic segments, returning the
+// per-wildcard substitutions in ordinal order (one entry per '*' or '>' wildcard;
+// a '>' substitution joins its matched segments with '/'). The multi-segment
+// wildcard '>' is matched with backtracking so that trailing literals (e.g.
+// "a/>/c") are honored rather than consuming all remaining segments greedily.
 func MatchSegments(pattern, topic []string) (bool, []string) {
-	substitutions := []string{}
-	i, j := 0, 0
+	var subs []string
+	if matchSegments(pattern, topic, 0, 0, &subs) {
+		return true, subs
+	}
+	return false, nil
+}
 
-	for i < len(pattern) && j < len(topic) {
-		p := pattern[i]
-		t := topic[j]
-
-		if p == "*" {
-			// Single-segment wildcard
-			substitutions = append(substitutions, t)
-			i++
-			j++
-		} else if p == ">" {
-			// Multi-segment wildcard - matches zero or more segments
-			// Collect all remaining topic segments
-			remaining := []string{}
-			for _, seg := range topic[j:] {
-				remaining = append(remaining, seg)
+func matchSegments(p, t []string, pi, ti int, subs *[]string) bool {
+	for pi < len(p) {
+		seg := p[pi]
+		switch seg {
+		case "*":
+			if ti >= len(t) {
+				return false
 			}
-			substitutions = append(substitutions, strings.Join(remaining, "/"))
-			i++
-			j = len(topic) // Consume all remaining
-		} else if p == t {
-			// Literal match
-			i++
-			j++
-		} else {
-			return false, nil
-		}
-	}
-
-	// Check if we've consumed all pattern segments
-	if i < len(pattern) {
-		// Pattern has more segments
-		// Check if remaining are all multi-wildcards
-		for _, p := range pattern[i:] {
-			if p != ">" {
-				return false, nil
+			*subs = append(*subs, t[ti])
+			pi++
+			ti++
+		case ">":
+			maxK := len(t) - ti
+			for k := 0; k <= maxK; k++ {
+				saved := len(*subs)
+				if k > 0 {
+					*subs = append(*subs, strings.Join(t[ti:ti+k], "/"))
+				} else {
+					*subs = append(*subs, "")
+				}
+				if matchSegments(p, t, pi+1, ti+k, subs) {
+					return true
+				}
+				*subs = (*subs)[:saved]
 			}
-		}
-		// All remaining are multi-wildcards, which is OK
-		// Add empty substitutions for each
-		for range pattern[i:] {
-			substitutions = append(substitutions, "")
-		}
-	}
-
-	// Check if we've consumed all topic segments
-	if j < len(topic) {
-		// Topic has more segments
-		// Only OK if pattern ends with multi-wildcard
-		if len(pattern) == 0 || pattern[len(pattern)-1] != ">" {
-			return false, nil
+			return false
+		default:
+			if ti >= len(t) || seg != t[ti] {
+				return false
+			}
+			pi++
+			ti++
 		}
 	}
-
-	return true, substitutions
+	return ti == len(t)
 }
 
 // NormalizeTopicName normalizes a topic name by removing leading/trailing

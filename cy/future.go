@@ -109,6 +109,19 @@ func (f *futureBase) Destroy() {
 	f.callback = nil
 }
 
+// notifyCallback invokes the future's callback (if any and not destroyed),
+// without marking the future done. Used by futures whose completion state is
+// computed on demand (e.g. SubscriptionFuture). Caller must not hold f.mu.
+func (f *futureBase) notifyCallback() {
+	f.mu.Lock()
+	cb := f.callback
+	destroyed := f.destroyed
+	f.mu.Unlock()
+	if cb != nil && !destroyed {
+		cb(f)
+	}
+}
+
 // complete marks the future as done with the specified error.
 func (f *futureBase) complete(err Error) {
 	f.mu.Lock()
@@ -153,18 +166,16 @@ func (f *futureBase) updateError(err Error) {
 }
 
 // SubscriptionFuture is a future for subscription operations.
-// It represents a subscription that will receive messages.
+// Its completion state is computed from the subscriber: a future is "done" when
+// a message has been received (or, for liveness-monitored subscriptions, when no
+// message arrives within the liveness timeout). Consuming the arrival via
+// ArrivalMove flips it back to pending, faithfully modeling the sampling-port
+// contract.
 type SubscriptionFuture struct {
 	futureBase
 
 	// sub is the associated subscriber.
 	sub *Subscriber
-
-	// arrival is the last received message arrival.
-	arrival *Arrival
-
-	// mu protects the arrival field.
-	arrivalMu sync.RWMutex
 }
 
 // NewSubscriptionFuture creates a new subscription future.
@@ -175,27 +186,50 @@ func NewSubscriptionFuture(sub *Subscriber) *SubscriptionFuture {
 	}
 }
 
-// Arrival returns the last received message arrival.
-// Returns nil if no message has been received yet.
-func (f *SubscriptionFuture) Arrival() *Arrival {
-	f.arrivalMu.RLock()
-	defer f.arrivalMu.RUnlock()
-	return f.arrival
+// Done returns true if the subscription has a pending arrival or has timed out
+// on liveness. It flips back to false after ArrivalMove consumes the arrival.
+func (f *SubscriptionFuture) Done() bool { return f.sub.isDone() }
+
+// Error returns the current (or final) error of the subscription.
+func (f *SubscriptionFuture) Error() Error { return f.sub.error() }
+
+// Arrival returns the last received message arrival (nil if none).
+func (f *SubscriptionFuture) Arrival() *Arrival { return f.sub.lastArrivalSnapshot() }
+
+// ArrivalMove moves the last arrival out of the future (transferring ownership)
+// and clears the future's reference so Done() flips back to pending.
+// Mirrors C cy_arrival_move.
+func (f *SubscriptionFuture) ArrivalMove() *Arrival { return f.sub.arrivalMove() }
+
+// ArrivalCount returns the number of messages delivered so far.
+// Mirrors C cy_arrival_count.
+func (f *SubscriptionFuture) ArrivalCount() uint64 { return f.sub.arrivalCount() }
+
+// SubscriberName returns the subscription name (verbatim topic name or pattern).
+// Mirrors C cy_subscriber_name.
+func (f *SubscriptionFuture) SubscriberName() string { return f.sub.Name() }
+
+// Substitutions returns the per-wildcard substitutions for the given matched
+// topic. Mirrors C cy_subscriber_substitutions.
+func (f *SubscriptionFuture) Substitutions(topic *Topic) []string {
+	return f.sub.Substitutions(topic)
 }
 
-// SetArrival sets the last received message arrival.
-func (f *SubscriptionFuture) SetArrival(arrival *Arrival) {
-	f.arrivalMu.Lock()
-	defer f.arrivalMu.Unlock()
-	f.arrival = arrival
+// SetCallback sets a callback to be invoked when the subscription updates
+// (each new arrival / liveness timeout). If the subscription is already done, the
+// callback is invoked immediately.
+func (f *SubscriptionFuture) SetCallback(callback func(Future)) {
+	f.futureBase.mu.Lock()
+	f.futureBase.callback = callback
+	f.futureBase.mu.Unlock()
+	if f.Done() {
+		f.futureBase.notifyCallback()
+	}
 }
 
 // Destroy destroys the subscription future.
 func (f *SubscriptionFuture) Destroy() {
 	f.futureBase.Destroy()
-	f.arrivalMu.Lock()
-	f.arrival = nil
-	f.arrivalMu.Unlock()
 }
 
 // PublicationFuture is a future for publication operations.

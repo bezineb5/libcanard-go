@@ -281,7 +281,7 @@ func (c *Cy) destroyTopic(topic *Topic) {
 	// Destroy all subscribers on this topic
 	if subs, ok := c.subscribers[topic]; ok {
 		for _, sub := range subs {
-			sub.Destroy()
+			sub.teardownLocked()
 		}
 		delete(c.subscribers, topic)
 	}
@@ -403,15 +403,10 @@ func (c *Cy) handleMulticastMessage(lane Lane, subjectID uint32, message Message
 		if topic != nil {
 			// Inline CRDT gossip + deliver to subscribers.
 			c.onGossipKnownTopic(topic, evictions, int32(lage), gossipInline, now)
-			if subs, ok := c.subscribers[topic]; ok {
-				for _, sub := range subs {
-					sub.Deliver(message, lane, msgTag)
-				}
+			acknowledge := c.deliverTopic(topic, message, lane, msgTag, reliable, now)
+			if reliable && acknowledge {
+				c.sendAck(lane, topic.Hash(), msgTag, now)
 			}
-			for sub := range c.patternMatcher.Match(topic.name) {
-				sub.Deliver(message, lane, msgTag)
-			}
-			_ = reliable
 		} else {
 			// We occupy this subject-ID for a different topic: collision arbitration.
 			c.onGossipUnknownTopic(hash, evictions, int32(lage), now)
@@ -444,6 +439,61 @@ func (c *Cy) handleMulticastMessage(lane Lane, subjectID uint32, message Message
 	default:
 		// Unknown/unsupported multicast type.
 	}
+}
+
+// deliverTopic applies topic-level reliable deduplication and dispatches a data
+// frame to all verbatim and pattern subscribers, returning whether the message
+// should be acknowledged (reliable transfers only). It is a faithful port of the
+// subscriber-dispatch tail of C on_message.
+func (c *Cy) deliverTopic(topic *Topic, message MessageTS, lane Lane, msgTag uint64, reliable bool, now Microsecond) bool {
+	patternSubs := c.patternMatcher.Match(topic.name)
+	hasSubs := len(c.subscribers[topic]) > 0 || len(patternSubs) > 0
+
+	if reliable && !hasSubs {
+		// No local subscribers: still re-ack duplicates passively (C re-arms the
+		// dedup filter and returns dedup_check so retransmitted ACKs are answered).
+		if topic.dedupCheck(lane.ID, msgTag, now) {
+			return true
+		}
+		return false
+	}
+
+	var dd *dedupState
+	if reliable {
+		dd = topic.dedupFindOrCreate(lane.ID, msgTag, now)
+		if dd.check(msgTag) {
+			return true // duplicate -> acknowledge, do not deliver
+		}
+	}
+
+	acknowledge := false
+	for _, sub := range c.subscribers[topic] {
+		sub.dropStaleReordering(now)
+		if sub.deliver(message, lane, msgTag, topic) {
+			acknowledge = true
+		}
+	}
+	for sub := range patternSubs {
+		sub.dropStaleReordering(now)
+		if sub.deliver(message, lane, msgTag, topic) {
+			acknowledge = true
+		}
+	}
+
+	if reliable && acknowledge && dd != nil {
+		dd.commit(msgTag)
+		dd.lastActiveAt = now
+	}
+	return acknowledge
+}
+
+// sendAck transmits a positive acknowledgement for a reliable transfer. It is
+// invoked synchronously from the delivery path. The platform lock is independent
+// of c.mu, so this does not deadlock even though c.mu is held by the caller.
+func (c *Cy) sendAck(lane Lane, hash, tag uint64, now Microsecond) {
+	header := NewACKHeader(true, hash, tag)
+	ackLane := Lane{ID: lane.ID, Priority: PriorityNominal}
+	_ = c.platform.Unicast(ackLane, now+100000, header.MarshalBinary())
 }
 
 // handleUnicastMessage handles an incoming unicast message.
@@ -645,13 +695,19 @@ func (c *Cy) Advertise(topicName string) (*Publisher, error) {
 func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.subscribeLocked(topicName, extent, false)
+	return c.subscribeLocked(topicName, extent, -1)
 }
 
 // subscribeLocked resolves a subscription. It assumes c.mu is already held by the
 // caller; this lets the auto-subscribe (gossip) path subscribe from within the
 // handle-message critical section without re-entering the lock.
-func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subscriber, error) {
+//
+// reorderingWindow selects the delivery mode: a value of -1 disables reordering
+// (unordered delivery); any non-negative value enables strictly-increasing
+// in-order delivery per (remote, topic) using that window. This mirrors C
+// subscriber_params_t.reordering_window, where cy_subscribe uses -1 and
+// cy_subscribe_ordered uses a non-negative window.
+func (c *Cy) subscribeLocked(topicName string, extent int, reorderingWindow Microsecond) (*Subscriber, error) {
 	// Resolve the topic name (applies namespace, remapping, pin, and validation).
 	resolved := c.Resolve(topicName)
 	if !resolved.Ok {
@@ -661,10 +717,10 @@ func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subsc
 
 	// Check if this is a pattern subscription
 	if IsPattern(resolvedName) {
-		// Pattern subscribers are inherently unordered; an ordered request on a
-		// pattern name still yields a regular pattern subscriber (matches the
-		// pre-existing SubscribeOrdered behavior).
-		sub := NewPatternSubscriber(c, resolvedName, extent)
+		// Pattern subscribers are inherently unordered unless an explicit window is
+		// requested; an ordered request on a pattern name still yields a regular
+		// pattern subscriber (matches the pre-existing SubscribeOrdered behavior).
+		sub := newPatternSubscriber(c, resolvedName, extent)
 
 		// Add to pattern matcher
 		firstForPattern := !c.patternMatcher.HasPattern(resolvedName)
@@ -686,24 +742,25 @@ func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subsc
 	if err != nil {
 		return nil, err
 	}
-	// Create a new subscriber
-	var sub *Subscriber
-	if ordered {
-		sub = NewOrderedSubscriber(c, topic, extent)
-	} else {
-		sub = NewSubscriber(c, topic, extent)
-	}
+	// Create a new subscriber (unordered or ordered per the requested window).
+	sub := newSubscriber(c, topic, extent, reorderingWindow)
 	c.subscribers[topic] = append(c.subscribers[topic], sub)
 
 	return sub, nil
 }
 
 // SubscribeOrdered creates a new ordered subscriber for the specified topic.
-// Ordered subscribers receive messages in the exact order they were sent.
-func (c *Cy) SubscribeOrdered(topicName string, extent int) (*Subscriber, error) {
+// Ordered subscribers receive messages in the exact order they were sent, waiting
+// up to reorderingWindow microseconds for missing messages before closing a gap.
+// A non-negative window is required (matching C cy_subscribe_ordered); a negative
+// value is clamped to zero.
+func (c *Cy) SubscribeOrdered(topicName string, extent int, reorderingWindow Microsecond) (*Subscriber, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.subscribeLocked(topicName, extent, true)
+	if reorderingWindow < 0 {
+		reorderingWindow = 0
+	}
+	return c.subscribeLocked(topicName, extent, reorderingWindow)
 }
 
 // Remap installs (or replaces) a name remapping rule: a subscription/advertise of
