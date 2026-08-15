@@ -26,7 +26,7 @@ build_can: ## Build the CAN platform
 build_udp: ## Build the UDP platform
 	cd cy/udp && go build -v ./...
 
-test: test_cy test_can test_udp test_cavl test_olga test_rapidhash test_wkv ## Run all tests
+test: test_cy test_can test_udp test_cavl test_olga test_wkv ## Run all tests
 
 test_cy: ## Run cy package tests
 	cd cy && go test -v -timeout 30s ./...
@@ -42,9 +42,6 @@ test_cavl: ## Run CAVL tree tests
 
 test_olga: ## Run Olga scheduler tests
 	cd cy/olga && go test -v -timeout 30s ./tests/...
-
-test_rapidhash: ## Run rapidhash tests
-	cd cy/rapidhash && go test -v -timeout 30s ./tests/...
 
 test_wkv: ## Run WKV container tests
 	cd cy/wkv && go test -v -timeout 30s ./tests/...

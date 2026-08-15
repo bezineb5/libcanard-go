@@ -1,6 +1,7 @@
 package cy
 
 import (
+	"encoding/binary"
 	"sync"
 	"unsafe"
 
@@ -127,11 +128,11 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 		cy.HandleMessage(lane, subjectID, message)
 	}
 
-	// Set the platform's message callback
-	// This would be done differently depending on the platform implementation
-	// For now, we'll set it up in the platform base
-	if pb, ok := platform.(*PlatformBase); ok {
-		pb.OnMessage = cy.onMessage
+	// Set the platform's message callback.
+	// Works for a bare *PlatformBase and for any platform that embeds it
+	// (the SetOnMessage method is promoted), so embedding platforms are wired correctly.
+	if s, ok := platform.(interface{ SetOnMessage(OnMessageCallback) }); ok {
+		s.SetOnMessage(cy.onMessage)
 	}
 
 	return cy, nil
@@ -269,164 +270,113 @@ func (c *Cy) HandleMessage(lane Lane, subjectID *uint32, message MessageTS) {
 }
 
 // handleMulticastMessage handles a multicast message.
+// Mirrors C cy_on_message: read the message tag, then skip the 24-byte session
+// header, then dispatch.
 func (c *Cy) handleMulticastMessage(lane Lane, subjectID uint32, message MessageTS) {
-	// Find the topic for this subject-ID
-	topic := c.findTopicBySubjectID(subjectID)
-	if topic == nil {
-		// Unknown topic - might be gossip or other protocol message
-		c.handleProtocolMessage(subjectID, message)
+	if message.Content == nil || message.Content.Size() < HeaderSize {
 		return
 	}
-
-	// Deliver to all subscribers on this topic
-	if subs, ok := c.subscribers[topic]; ok {
-		for _, sub := range subs {
-			sub.Deliver(message, lane)
-		}
+	// Extract the message tag (C: header[16:24]) before skipping the header.
+	var tagBuf [8]byte
+	var msgTag uint64
+	if message.Content.Read(16, 8, tagBuf[:]) == 8 {
+		msgTag = binary.LittleEndian.Uint64(tagBuf[:])
 	}
-	
-	// Also check for pattern subscribers
-	matches := c.patternMatcher.Match(topic.name)
-	for sub := range matches {
-		// In a real implementation, we'd set the substitutions on the subscriber
-		sub.Deliver(message, lane)
-	}
-}
+	// C always skips the session header before dispatch.
+	message.Content.Skip(HeaderSize)
 
-// handleUnicastMessage handles a unicast message.
-func (c *Cy) handleUnicastMessage(lane Lane, message MessageTS) {
-	// Unicast messages are typically responses to requests
-	// or reliable delivery ACK/NACK messages
-	
-	// For now, just pass to RPC handler
-	// In a real implementation, we'd parse the message header
-	// to determine the type
-	
-	// Check if this is a response to a request
-	// (Would parse message header for request tag)
-	// For now, we'll just ignore
-}
-
-// handleProtocolMessage handles protocol-level messages (gossip, etc.).
-func (c *Cy) handleProtocolMessage(subjectID uint32, message MessageTS) {
-	// Check if this is a gossip message
-	// Gossip messages are sent on subject-IDs above SubjectIDPinnedMax
-	if subjectID > SubjectIDPinnedMax {
-		// This might be a gossip shard
-		if message.Content != nil {
+	// Determine the dispatch scope (C: multicast vs broadcast vs shard).
+	topic := c.findTopicBySubjectID(subjectID)
+	if topic == nil {
+		// Unknown subject-ID. Above SubjectIDPinnedMax => gossip/aux subject.
+		if subjectID > SubjectIDPinnedMax {
 			c.gossip.ProcessGossip(message.Content.Payload(), subjectID)
 		}
 		return
 	}
-	
-	// Check for protocol messages (ACK, NACK, Request, Response, etc.)
-	// These are identified by their message type in the payload
-	if message.Content != nil && len(message.Content.Payload()) >= ProtocolHeaderSize {
-		msgType := ProtocolMessageType(message.Content.Payload()[0])
-		switch msgType {
-		case ProtocolMessageACK:
-			c.handleACKMessage(message)
-		case ProtocolMessageNACK:
-			c.handleNACKMessage(message)
-		case ProtocolMessageRequest:
-			c.handleRequestMessage(message)
-		case ProtocolMessageResponse:
-			c.handleResponseMessage(message)
-		case ProtocolMessageGossip:
-			// Already handled above
+
+	// Known topic: deliver to subscribers on this topic.
+	if subs, ok := c.subscribers[topic]; ok {
+		for _, sub := range subs {
+			sub.Deliver(message, lane, msgTag)
 		}
 	}
-}
-
-// handleACKMessage handles an incoming ACK message.
-func (c *Cy) handleACKMessage(message MessageTS) {
-	if message.Content == nil || len(message.Content.Payload()) < ACKMessageSize {
-		return
-	}
-	
-	// Parse the ACK message
-	var ack ACKMessage
-	err := ack.UnmarshalBinary(message.Content.Payload())
-	if err != nil {
-		return
-	}
-	
-	// Find the publisher that sent the message with this tag
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
-	for _, pub := range c.publishers {
-		// Forward to the publisher's reliable delivery
-		pub.handleAck(ack.SourceNodeID, ack.Tag)
+	matches := c.patternMatcher.Match(topic.name)
+	for sub := range matches {
+		sub.Deliver(message, lane, msgTag)
 	}
 }
 
-// handleNACKMessage handles an incoming NACK message.
-func (c *Cy) handleNACKMessage(message MessageTS) {
-	if message.Content == nil || len(message.Content.Payload()) < NACKMessageSize {
+// handleUnicastMessage handles an incoming unicast message.
+// Mirrors C cy_on_message unicast branch: read type + tag from the 24-byte header,
+// skip it, then dispatch on the type. The tag (header field at offset 16:24) is the
+// correlation tag for ACK/NACK/response handling.
+func (c *Cy) handleUnicastMessage(lane Lane, message MessageTS) {
+	if message.Content == nil || message.Content.Size() < HeaderSize {
 		return
 	}
-	
-	// Parse the NACK message
-	var nack NACKMessage
-	err := nack.UnmarshalBinary(message.Content.Payload())
-	if err != nil {
+	// Read the type byte from offset 0 and the tag from offset 16 before skipping.
+	var hdr [HeaderSize]byte
+	if message.Content.Read(0, HeaderSize, hdr[:]) != HeaderSize {
 		return
 	}
-	
-	// Find the publisher that sent the message with this tag
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
-	for _, pub := range c.publishers {
-		// Forward to the publisher's reliable delivery
-		pub.handleNack(nack.SourceNodeID, nack.Tag)
+	msgType := HeaderType(hdr[0])
+	tag := binary.LittleEndian.Uint64(hdr[16:24])
+	message.Content.Skip(HeaderSize)
+
+	switch msgType {
+	case HeaderTypeMsgAck, HeaderTypeMsgNack:
+		c.handleACKMessage(lane, tag)
+	case HeaderTypeRspBE, HeaderTypeRspRel:
+		c.handleResponseMessage(lane, hdr, message)
+	case HeaderTypeRspAck, HeaderTypeRspNack:
+		c.handleResponseAckMessage(lane, hdr, message)
+	default:
+		// Unicast carrying a non-unicast type is invalid; ignore.
 	}
 }
 
-// handleRequestMessage handles an incoming request message.
-func (c *Cy) handleRequestMessage(message MessageTS) {
-	if message.Content == nil || len(message.Content.Payload()) < RequestMessageSize {
+// handleResponseMessage handles an incoming response (C header_rsp_be/rel).
+// The 24-byte response header carries [1]=tag, [2:8]=seqno(u48), [8:16]=hash,
+// [16:24]=message_tag. The message_tag is the correlation with the original request;
+// seqno is the response stream sequence number.
+func (c *Cy) handleResponseMessage(lane Lane, hdr [HeaderSize]byte, message MessageTS) {
+	if message.Content == nil {
 		return
 	}
-	
-	// Parse the request message
-	var req RequestMessage
-	err := req.UnmarshalBinary(message.Content.Payload())
+	parsed, err := ParseResponseHeader(hdr[:])
 	if err != nil {
 		return
 	}
-	
-	// For now, just log that we received a request
-	// In a full implementation, we'd look up the service and invoke the handler
-	// For testing purposes, we'll forward to the RPC handler
-	c.rpc.HandleRequest(req.Tag, uint64(req.RequestID), req.SourceNodeID, message)
-}
-
-// handleResponseMessage handles an incoming response message.
-func (c *Cy) handleResponseMessage(message MessageTS) {
-	if message.Content == nil || len(message.Content.Payload()) < ResponseMessageSize {
-		return
-	}
-	
-	// Parse the response message
-	var resp ResponseMessage
-	err := resp.UnmarshalBinary(message.Content.Payload())
-	if err != nil {
-		return
-	}
-	
-	// Find the RPC instance and forward the response
-	c.rpc.HandleResponse(resp.Tag, Response{
-		RemoteID:  resp.SourceNodeID,
-		Seqno:     uint64(resp.RequestID),
+	c.rpc.HandleResponse(parsed.MessageTag, Response{
+		RemoteID:  lane.ID,
+		Seqno:     parsed.Seqno,
 		Timestamp: c.Now(),
 		Message:   &message,
 	})
 }
 
-// Advertise creates a new publisher on the specified topic.
-// The topic will be created if it doesn't already exist.
+// handleACKMessage handles an incoming message ACK/NACK (C header_msg_ack/nack).
+// The tag is the header's tag field; we ACK every publisher's tag (C collapses to
+// a single ack on the publishing node).
+func (c *Cy) handleACKMessage(lane Lane, tag uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, pub := range c.publishers {
+		pub.handleAck(lane.ID, tag)
+	}
+}
+
+// handleResponseAckMessage handles a response ACK/NACK (C header_rsp_ack/nack).
+func (c *Cy) handleResponseAckMessage(lane Lane, hdr [HeaderSize]byte, message MessageTS) {
+	// Placeholder: response ACK correlation is handled at the RPC layer.
+}
+
+
+// handleRequestMessage is unused under the C wire model (requests arrive via the
+// subscriber path / unicast). Retained for API completeness.
+func (c *Cy) handleRequestMessage(message MessageTS) {
+}
 func (c *Cy) Advertise(topicName string) (*Publisher, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -435,7 +385,7 @@ func (c *Cy) Advertise(topicName string) (*Publisher, error) {
 	resolvedName := c.resolveTopicName(topicName)
 
 	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName)
+	topic, err := c.findOrCreateTopic(resolvedName, DefaultTopicExtent)
 	if err != nil {
 		return nil, err
 	}
@@ -475,11 +425,10 @@ func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 	}
 
 	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName)
+	topic, err := c.findOrCreateTopic(resolvedName, extent)
 	if err != nil {
 		return nil, err
 	}
-
 	// Create a new subscriber
 	sub := NewSubscriber(c, topic, extent)
 	c.subscribers[topic] = append(c.subscribers[topic], sub)
@@ -504,13 +453,13 @@ func (c *Cy) SubscribeOrdered(topicName string, extent int) (*Subscriber, error)
 	}
 
 	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName)
+	topic, err := c.findOrCreateTopic(resolvedName, extent)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create a new ordered subscriber
-	sub := NewOrderedSubscriber(c, topic, extent)
+	// Create a new subscriber
+	sub := NewSubscriber(c, topic, extent)
 	c.subscribers[topic] = append(c.subscribers[topic], sub)
 
 	return sub, nil
@@ -532,17 +481,19 @@ func (c *Cy) resolveTopicName(name string) string {
 }
 
 // findOrCreateTopic finds a topic by name or creates it if it doesn't exist.
-func (c *Cy) findOrCreateTopic(name string) (*Topic, error) {
+// extent is the maximum message size for the topic (per subscription) and is applied
+// before the platform reader is created.
+func (c *Cy) findOrCreateTopic(name string, extent int) (*Topic, error) {
 	// Check if the topic already exists
 	if topic, ok := c.topicsByName[name]; ok {
 		return topic, nil
 	}
-
 	// Create a new topic
 	topic, err := newTopic(name, c.subjectIDModulus)
 	if err != nil {
 		return nil, err
 	}
+	topic.extent = extent
 
 	// Add to CRDT
 	state := c.crdt.AddTopic(name, topic.hash)

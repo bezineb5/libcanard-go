@@ -115,33 +115,14 @@ func (rd *ReliableDelivery) Publish(deadline Microsecond, data []byte) *Publicat
 	return future
 }
 
-// sendMessage sends a reliable message with the tag encoded in the header.
+// sendMessage sends a reliable message. The 24-byte Cy session header with
+// type=msg_rel is prepended by publishImpl (never double-prepended).
 func (rd *ReliableDelivery) sendMessage(rmsg *reliableMessage) {
 	pub := rd.publisher
-	
-	// Create a header with the message tag
-	// SourceNodeID would typically come from the platform or Cy instance
-	// For now, we use 0 as a placeholder
-	header := NewHeader(
-		rmsg.tag,
-		0, // sequence number (not used for reliable)
-		pub.cy.Now(),
-		pub.priority,
-		0, // SourceNodeID - placeholder, would be set from platform
-	)
-	
-	// Prepend the header to the data
-	payloadWithHeader := PrependHeader(header, rmsg.data)
-	
-	// If we have associations, we might send unicast
-	// Otherwise, send multicast
-	if len(rd.associations) > 0 {
-		// For now, just send multicast
-		// In a real implementation, we'd send unicast to each association
-		pub.Publish(rmsg.deadline, payloadWithHeader)
-	} else {
-		pub.Publish(rmsg.deadline, payloadWithHeader)
-	}
+	// publishImpl prepends the header (type msg_rel) and uses the publisher's
+	// tag generator; the reliable tag (rmsg.tag) is tracked separately for
+	// ACK correlation but the wire tag is the publisher sequence tag.
+	_ = pub.publishImpl(rmsg.deadline, rmsg.data, HeaderTypeMsgRel)
 }
 
 // handleTimeout handles a timeout for a reliable message.

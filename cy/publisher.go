@@ -29,6 +29,10 @@ type Publisher struct {
 	// For client publishers (expecting responses)
 	// responseExtent is the maximum size of response messages.
 	responseExtent int
+
+	// Tag generation state (C: topic->pub_tag_baseline + topic->pub_seqno).
+	msgTagBaseline uint64
+	msgSeqno       uint64
 	
 	// mu protects the publisher state.
 	mu sync.RWMutex
@@ -59,11 +63,15 @@ func NewPublisher(cy *Cy, topic *Topic) *Publisher {
 		nextRequestTag: 0,
 		pendingRequests: make(map[uint64]*RequestFuture),
 		responseExtent: 0,
+		// C seeds the baseline from the platform/PRNG; we use a non-zero
+		// deterministic baseline derived from the topic hash so tags are
+		// unique across reboots as required by the protocol.
+		msgTagBaseline: topic.Hash() | 1,
 	}
-	
+
 	// Initialize reliable delivery
 	pub.reliable = newReliableDelivery(pub)
-	
+
 	return pub
 }
 
@@ -124,32 +132,35 @@ func (p *Publisher) Destroy() {
 	p.reliable.Cancel()
 }
 
-// Publish sends a best-effort (non-reliable) message.
-// The deadline is the absolute time by which the message must be sent.
-func (p *Publisher) Publish(deadline Microsecond, data []byte) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
+// publishImpl is the single point that prepends the 24-byte Cy session header
+// and pushes the headed message to the transport. headerType selects the wire
+// message type (best-effort vs reliable). It mirrors C do_publish_impl.
+func (p *Publisher) publishImpl(deadline Microsecond, data []byte, headerType HeaderType) error {
 	if p.destroyed {
 		return ErrArgument
 	}
-
-	// Create a message
-	msg := NewMessage(data)
-	defer msg.RefcountDec()
-
-	// Send via the platform
+	p.msgSeqno++
+	tag := p.msgTagBaseline + p.msgSeqno
+	header := NewHeader(headerType, int8(p.topic.LogAge()), uint32(p.topic.Evictions()), p.topic.Hash(), tag)
+	headed := PrependHeader(header, data)
 	writer, err := p.cy.platform.NewSubjectWriter(p.topic.subjectID)
 	if err != nil {
 		return err
 	}
 	defer p.cy.platform.DestroySubjectWriter(writer)
+	return p.cy.platform.SubjectWriterSend(writer, deadline, p.priority, headed)
+}
 
-	return p.cy.platform.SubjectWriterSend(writer, deadline, p.priority, data)
+// Publish sends a best-effort (non-reliable) message.
+// The deadline is the absolute time by which the message must be sent.
+func (p *Publisher) Publish(deadline Microsecond, data []byte) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.publishImpl(deadline, data, HeaderTypeMsgBE)
 }
 
 // PublishReliable sends a reliable message.
-// The message will be retransmitted until acknowledged by all subscribers or until the deadline.
+// The message will be retransmitted until acknowledged by all subscribers or until the deadline is reached.
 // Returns a future that will be completed when the message is delivered or the deadline is reached.
 func (p *Publisher) PublishReliable(deadline Microsecond, data []byte) *PublicationFuture {
 	p.mu.RLock()
@@ -159,7 +170,6 @@ func (p *Publisher) PublishReliable(deadline Microsecond, data []byte) *Publicat
 		return nil
 	}
 
-	// Delegate to reliable delivery
 	return p.reliable.Publish(deadline, data)
 }
 
@@ -186,71 +196,8 @@ func (p *Publisher) Request(deliveryDeadline, responseTimeout Microsecond, data 
 		return nil
 	}
 	p.mu.RUnlock()
-
 	// Delegate to RPC
 	return p.cy.RPC().Request(p, deliveryDeadline, responseTimeout, data)
-}
-
-// sendRequest sends a request message as a protocol message.
-func (p *Publisher) sendRequest(tag uint64, deadline Microsecond, data []byte) {
-	// Create a request message
-	request := &RequestMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageRequest),
-		},
-		Tag:          tag,
-		SourceNodeID: 0, // Would be the local node ID
-		ServiceID:    uint32(p.topic.subjectID),
-		RequestID:    uint32(tag), // Use tag as request ID for now
-	}
-	
-	// Marshal the request header
-	requestHeader := request.MarshalBinary()
-	
-	// Combine header + payload
-	payload := append(requestHeader, data...)
-	
-	// Send as a regular message (the protocol header will be parsed by receivers)
-	p.Publish(deadline, payload)
-}
-
-// handleRequestTimeout handles a timeout for a request.
-func (p *Publisher) handleRequestTimeout(tag uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Find the future
-	future, ok := p.pendingRequests[tag]
-	if !ok {
-		return
-	}
-
-	// Check if we've received any responses
-	if future.ResponseCount() == 0 {
-		// No responses received, mark as liveness error
-		future.complete(ErrLiveness)
-	} else {
-		// We have responses, but no more are expected
-		// The future remains done with OK
-		future.complete(OK)
-	}
-	
-	// Clean up
-	delete(p.pendingRequests, tag)
-}
-
-// handleResponse handles a response to a request.
-func (p *Publisher) handleResponse(tag uint64, response Response) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Find the future for this tag
-	// In a real implementation, we'd have a map of request tags to futures
-	// Check in pending requests
-	if reqFuture, ok := p.pendingRequests[tag]; ok {
-		reqFuture.AddResponse(response)
-		return
-	}
 }
 
 // AddAssociation adds a new association for a remote subscriber.

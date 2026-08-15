@@ -1,6 +1,7 @@
 package cy
 
 import (
+	"encoding/binary"
 	"sync"
 )
 
@@ -27,17 +28,22 @@ type RPC struct {
 // RequestHandler is a function that handles incoming requests.
 // It receives the request data and a responder for sending responses.
 type RequestHandler func(data []byte, responder *Responder)
-
-// Responder allows sending responses to a request.
+// Responder allows sending responses to a request. It carries the breadcrumb of the
+// original request so responses are sent back to the correct remote with the correct
+// correlation tag (message_tag) and stream sequence number.
 type Responder struct {
 	// rpc is the parent RPC instance.
 	rpc *RPC
+	// breadcrumb is the origin information of the received request.
+	breadcrumb *Breadcrumb
 	// tag is the request tag.
 	tag uint64
 	// remoteID is the remote node ID.
 	remoteID uint64
 	// requestID is the request ID.
 	requestID uint32
+	// hash is the service/topic hash this response belongs to.
+	hash uint64
 	// seqno is the current response sequence number.
 	seqno uint64
 	// onClose is called when the responder is done.
@@ -72,7 +78,7 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 	future := NewRequestFuture(tag)
 	r.requests[tag] = future
 	r.mu.Unlock()
-	
+
 	// Also store in publisher for backward compatibility
 	pub.mu.Lock()
 	pub.pendingRequests[tag] = future
@@ -83,33 +89,27 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 		r.handleResponseTimeout(tag, future)
 	})
 
-	// Send the request as a protocol message
+	// Send the request as a unicast with the 24-byte Cy session header.
 	go r.sendRequestMessage(pub, tag, deliveryDeadline, data)
 
 	return future
 }
 
-// sendRequestMessage sends a request message as a protocol message.
+// sendRequestMessage sends a request message as a unicast with the 24-byte Cy
+// session header (type msg_be). The payload carries [tag:8][requestID:4][serviceID:4]
+// followed by the request data. RPC framing is a stub; this mirrors the C transport path.
 func (r *RPC) sendRequestMessage(pub *Publisher, tag uint64, deadline Microsecond, data []byte) {
-	// Create a request message
-	request := &RequestMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageRequest),
-		},
-		Tag:          tag,
-		SourceNodeID: 0, // Would be the local node ID
-		ServiceID:    uint32(pub.Topic().SubjectID()),
-		RequestID:    uint32(tag), // Use tag as request ID for now
-	}
-	
-	// Marshal the request header
-	requestHeader := request.MarshalBinary()
-	
-	// Combine header + payload
-	payload := append(requestHeader, data...)
-	
-	// Send via the publisher
-	pub.Publish(deadline, payload)
+	payload := make([]byte, 16+len(data))
+	binary.LittleEndian.PutUint64(payload[0:8], tag)
+	binary.LittleEndian.PutUint32(payload[8:12], uint32(tag)) // requestID = tag for now
+	binary.LittleEndian.PutUint32(payload[12:16], uint32(pub.Topic().SubjectID()))
+	copy(payload[16:], data)
+
+	header := NewHeader(HeaderTypeMsgBE, 0, 0, pub.Topic().Hash(), tag)
+	headed := PrependHeader(header, payload)
+
+	lane := Lane{ID: 0, Priority: pub.Priority()}
+	_ = r.cy.platform.Unicast(lane, deadline, headed)
 }
 
 // handleResponseTimeout handles timeout for a request.
@@ -119,13 +119,11 @@ func (r *RPC) handleResponseTimeout(tag uint64, future *RequestFuture) {
 
 	// Check if we have responses
 	if future.ResponseCount() == 0 {
-		// No responses received
 		future.complete(ErrLiveness)
 	} else {
-		// We have at least one response
 		future.complete(OK)
 	}
-	
+
 	// Clean up
 	delete(r.requests, tag)
 }
@@ -142,46 +140,36 @@ func (r *RPC) HandleResponse(tag uint64, response Response) {
 
 	// Add the response to the future
 	future.AddResponse(response)
-	
+
 	// Reset the liveness timeout
-	// The future will be completed when responses stop arriving
 	r.cy.olga.Schedule(int64(r.cy.Now()+responseTimeout), func() {
 		r.handleResponseTimeout(tag, future)
 	})
 }
 
-// HandleRequest handles an incoming request.
+// HandleRequest handles an incoming request. The request payload (after the 24-byte
+// header has been skipped by HandleMessage) carries [tag:8][requestID:4][serviceID:4][data].
 func (r *RPC) HandleRequest(tag, requestID uint64, sourceNodeID uint64, message MessageTS) {
-	// Extract the service ID from the request message
-	// The service ID should be in the request header
-	if message.Content == nil || len(message.Content.Payload()) < RequestMessageSize {
+	if message.Content == nil {
 		return
 	}
-	
-	// Parse the request message to get the service ID
-	var req RequestMessage
-	err := req.UnmarshalBinary(message.Content.Payload())
-	if err != nil {
+	payload := message.Content.Payload()
+	if len(payload) < 16 {
 		return
 	}
-	
-	// Find the service handler
+	reqTag := binary.LittleEndian.Uint64(payload[0:8])
+	reqID := binary.LittleEndian.Uint32(payload[8:12])
+	serviceID := binary.LittleEndian.Uint32(payload[12:16])
+	requestData := payload[16:]
+
 	r.mu.RLock()
-	handler := r.services[req.ServiceID]
+	handler := r.services[serviceID]
 	r.mu.RUnlock()
-	
 	if handler == nil {
-		// No handler for this service - could send an error response
 		return
 	}
-	
-	// Extract the request data (payload after the request header)
-	requestData := message.Content.Payload()[RequestMessageSize:]
-	
-	// Create a responder
-	responder := r.newResponder(tag, sourceNodeID, uint32(requestID))
-	
-	// Invoke the handler
+	bc := NewBreadcrumb(r.cy, PriorityNominal, sourceNodeID, 0, reqTag)
+	responder := r.newResponder(reqTag, sourceNodeID, reqID, 0, bc)
 	handler(requestData, responder)
 }
 
@@ -225,123 +213,103 @@ func (r *RPC) GetService(serviceID uint32) RequestHandler {
 	return r.services[serviceID]
 }
 
-// newResponder creates a new responder for a request.
-func (r *RPC) newResponder(tag uint64, remoteID uint64, requestID uint32) *Responder {
+// newResponder creates a new responder for a request, capturing the breadcrumb so the
+// response can be correlated (message_tag) and routed back to the correct remote.
+func (r *RPC) newResponder(tag uint64, remoteID uint64, requestID uint32, hash uint64, breadcrumb *Breadcrumb) *Responder {
 	return &Responder{
-		rpc:      r,
-		tag:      tag,
-		remoteID:  remoteID,
-		requestID: requestID,
-		seqno:     0,
-		onClose:   func() {},
+		rpc:        r,
+		breadcrumb: breadcrumb,
+		tag:        tag,
+		remoteID:   remoteID,
+		requestID:  requestID,
+		hash:       hash,
+		seqno:      0,
+		onClose:    func() {},
 	}
 }
 
 // ResponseTimeout is the default response timeout (from C library).
 const responseTimeout = 1000000 // 1 second in microseconds
 
-// Respond sends a response to a request.
-// This is called by subscribers when they want to respond to a received request.
+// sendResponse emits a response (or error response) to the requester over unicast,
+// using the C-compatible response header layout: [0]=type, [1]=tag, [2:8]=seqno(u48),
+// [8:16]=hash, [16:24]=message_tag. The small response tag is taken from the
+// breadcrumb's current seqno low byte; the 48-bit seqno is the breadcrumb seqno.
+func (resp *Responder) sendResponse(reliable bool, data []byte) error {
+	bc := resp.breadcrumb
+	if bc == nil {
+		return ErrArgument
+	}
+	// Increment the per-request stream seqno (starts at 0 -> first response seqno 0).
+	seqno := bc.IncrementSeqno() - 1
+	// C uses tag 0xFF for best-effort responses and a per-attempt tag for reliable.
+	tag := byte(0xFF)
+	if reliable {
+		tag = byte(seqno) // deterministic small tag for reliable retransmission correlation
+	}
+	header := MarshalRSPHeader(reliable, tag, seqno, bc.TopicHash, bc.MessageTag)
+	lane := Lane{ID: bc.RemoteID, Priority: bc.Priority}
+	copy(lane.Context[:], bc.UnicastCtx[:])
+	headed := make([]byte, 0, HeaderSize+len(data))
+	headed = append(headed, header...)
+	headed = append(headed, data...)
+	return resp.rpc.cy.platform.Unicast(lane, resp.rpc.cy.Now()+100000, headed)
+}
+
+// Respond sends a best-effort response to the request described by the breadcrumb.
 func (r *RPC) Respond(breadcrumb *Breadcrumb, seqno uint64, data []byte) error {
-	// In a real implementation, we'd:
-	// 1. Increment the breadcrumb's seqno
-	// 2. Encode the response with the breadcrumb info
-	// 3. Send as a unicast message to the requester
-	
-	// For now, just return OK
-	return OK
+	resp := r.newResponder(0, breadcrumb.RemoteID, 0, breadcrumb.TopicHash, breadcrumb)
+	if seqno != 0 {
+		breadcrumb.Seqno = seqno
+	}
+	return resp.sendResponse(false, data)
 }
 
-// RespondReliable sends a reliable response to a request.
+// RespondReliable sends a reliable response to the request described by the breadcrumb.
+// It returns a future that completes when the response has been transmitted.
 func (r *RPC) RespondReliable(breadcrumb *Breadcrumb, seqno uint64, data []byte) *PublicationFuture {
-	// In a real implementation, we'd:
-	// 1. Increment the breadcrumb's seqno
-	// 2. Create a reliable message with the response
-	// 3. Return a future that tracks delivery
-	
-	// For now, return nil
-	return nil
+	resp := r.newResponder(0, breadcrumb.RemoteID, 0, breadcrumb.TopicHash, breadcrumb)
+	if seqno != 0 {
+		breadcrumb.Seqno = seqno
+	}
+	return resp.sendResponseReliable(data)
 }
 
-// Send sends a response to the original requester.
+// sendResponseReliable emits the reliable response and wraps the send result in a future.
+func (resp *Responder) sendResponseReliable(data []byte) *PublicationFuture {
+	f := NewPublicationFuture(0, 1)
+	var e Error = OK
+	if err := resp.sendResponse(true, data); err != nil {
+		e = ErrArgument
+	}
+	f.complete(e)
+	return f
+}
+
+// Send sends a best-effort response to the original requester.
 func (resp *Responder) Send(data []byte) error {
-	// Create a response message
-	response := &ResponseMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageResponse),
-		},
-		Tag:          resp.tag,
-		SourceNodeID: 0, // Would be the local node ID
-		RequestID:    resp.requestID,
-		Status:      0, // OK
-	}
-	
-	// Marshal the response header
-	responseHeader := response.MarshalBinary()
-	
-	// Combine header + payload
-	payload := append(responseHeader, data...)
-	
-	// Create a lane for unicast to the requester
-	lane := Lane{
-		ID:       resp.remoteID,
-		Priority: PriorityNominal,
-	}
-	
-	// Send the response via unicast
-	// Note: This would need the platform to support unicast
-	// For now, we'll just return OK
-	_ = resp.rpc.cy.platform.Unicast(lane, resp.rpc.cy.Now()+100000, payload)
-	
-	// Increment sequence number
-	resp.seqno++
-	
-	return OK
+	return resp.sendResponse(false, data)
 }
 
-// SendError sends an error response to the original requester.
+// SendError sends an error response to the original requester. The error code is
+// currently carried as the first byte of the (application) payload, mirroring the
+// C convention where the response body begins with a status code.
 func (resp *Responder) SendError(errorCode uint8, data []byte) error {
-	// Create a response message with error status
-	response := &ResponseMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageResponse),
-		},
-		Tag:          resp.tag,
-		SourceNodeID: 0, // Would be the local node ID
-		RequestID:    resp.requestID,
-		Status:      errorCode,
-	}
-	
-	// Marshal the response header
-	responseHeader := response.MarshalBinary()
-	
-	// Combine header + payload
-	payload := append(responseHeader, data...)
-	
-	// Create a lane for unicast to the requester
-	lane := Lane{
-		ID:       resp.remoteID,
-		Priority: PriorityNominal,
-	}
-	
-	// Send the response via unicast
-	_ = resp.rpc.cy.platform.Unicast(lane, resp.rpc.cy.Now()+100000, payload)
-	
-	// Increment sequence number
-	resp.seqno++
-	
-	return OK
+	body := make([]byte, 0, 1+len(data))
+	body = append(body, errorCode)
+	body = append(body, data...)
+	return resp.sendResponse(false, body)
 }
 
 // StartStream starts a streaming response.
 func (resp *Responder) StartStream() *Streaming {
 	stream := newStreaming(resp.tag, resp.remoteID)
-	
+
 	resp.rpc.mu.Lock()
 	defer resp.rpc.mu.Unlock()
-	
+
 	resp.rpc.streams[resp.tag] = stream
-	
+
 	return stream
 }
 
@@ -358,16 +326,16 @@ type Streaming struct {
 
 	// requestTag is the tag of the original request.
 	requestTag uint64
-	
+
 	// remoteID is the remote node ID.
 	remoteID uint64
-	
+
 	// seqno is the current sequence number.
 	seqno uint64
-	
+
 	// active indicates if streaming is still active.
 	active bool
-	
+
 	// onClose is called when the stream is closed.
 	onClose func()
 }
@@ -376,7 +344,7 @@ type Streaming struct {
 func newStreaming(requestTag, remoteID uint64) *Streaming {
 	return &Streaming{
 		requestTag: requestTag,
-		remoteID:    remoteID,
+		remoteID:   remoteID,
 		seqno:      0,
 		active:     true,
 	}

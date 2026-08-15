@@ -150,6 +150,11 @@ const (
 	// ACKTXTimeout is how long pending ACK transfers wait in TX buffer if not transmitted.
 	ACKTXTimeout = 1000000 // 1 second
 
+	// DefaultTopicExtent is the receive extent used when a topic is created without an
+	// explicit subscriber extent (e.g. via Advertise). It must be large enough for the
+	// libcanard reassembly buffer; a zero extent would make ingest panic.
+	DefaultTopicExtent = 256
+
 	// SessionLifetime is how long soft states associated with remotes are retained.
 	SessionLifetime = 60 * 1000000 // 60 seconds
 

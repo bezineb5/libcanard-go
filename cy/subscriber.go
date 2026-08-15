@@ -182,8 +182,9 @@ func (s *Subscriber) Destroy() {
 	s.callback = nil
 }
 
-// Deliver delivers a message to this subscriber.
-func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
+// Deliver delivers a message to this subscriber. msgTag is the session-layer
+// message tag, extracted by HandleMessage before the 24-byte header is skipped.
+func (s *Subscriber) Deliver(message MessageTS, lane Lane, msgTag uint64) {
 	s.mu.RLock()
 	destroyed := s.destroyed
 	callback := s.callback
@@ -193,58 +194,16 @@ func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
 		return
 	}
 
-	// Check for protocol messages (requests, responses)
-	if message.Content != nil && len(message.Content.Payload()) >= ProtocolHeaderSize {
-		msgType := ProtocolMessageType(message.Content.Payload()[0])
-		
-		// Handle request messages
-		if msgType == ProtocolMessageRequest {
-			// Parse the request message
-			var req RequestMessage
-			err := req.UnmarshalBinary(message.Content.Payload())
-			if err == nil {
-				// Forward to RPC handler
-				s.cy.RPC().HandleRequest(req.Tag, uint64(req.RequestID), req.SourceNodeID, message)
-				return // Don't deliver to regular callback
-			}
-		}
-		
-		// Handle response messages
-		if msgType == ProtocolMessageResponse {
-			// Parse the response message
-			var resp ResponseMessage
-			err := resp.UnmarshalBinary(message.Content.Payload())
-			if err == nil {
-				// Forward to RPC handler
-				s.cy.RPC().HandleResponse(resp.Tag, Response{
-					RemoteID:  resp.SourceNodeID,
-					Seqno:     uint64(resp.RequestID),
-					Timestamp: s.cy.Now(),
-					Message:   &message,
-				})
-				return // Don't deliver to regular callback
-			}
-		}
-	}
-	
-	// Check for duplicate message (reliable delivery)
-	// Extract the tag from the message header if present
-	var msgTag uint64 = 0
-	if message.Content != nil && message.Content.Size() >= HeaderSize {
-		// Try to parse the header
-		if header, _, err := ExtractHeader(message.Content); err == nil {
-			msgTag = header.Tag
-		}
-	}
-
 	// Deduplication check
 	if msgTag != 0 {
 		s.mu.Lock()
 		// Check if we've seen this tag before
 		if s.receivedTags[msgTag] {
 			s.mu.Unlock()
-			// Duplicate message - send ACK but don't deliver
-			s.sendAck(lane.ID, msgTag)
+			// Duplicate message - send ACK but don't deliver.
+			// Async: sendAck re-enters the platform (Now + Unicast) and must
+			// not run while the caller holds the network/platform lock.
+			go s.sendAck(lane.ID, msgTag)
 			return
 		}
 		
@@ -252,8 +211,6 @@ func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
 		// If this tag is greater than lastTag+1, we have a gap
 		if msgTag > s.lastTag+1 {
 			// Send NACK for the missing messages
-			// In a real implementation, we'd send NACK for the gap
-			// For now, just send NACK for the previous tag
 			s.mu.Unlock()
 			go s.sendNack(lane.ID, s.lastTag+1)
 			
@@ -265,10 +222,8 @@ func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
 		s.receivedTags[msgTag] = true
 		
 		// Clean up old tags periodically
-		// Keep only the last N tags (window size)
 		const dedupWindowSize = 256
 		if len(s.receivedTags) > dedupWindowSize {
-			// Remove oldest tags
 			for tag := range s.receivedTags {
 				if tag <= s.lastTag-dedupWindowSize {
 					delete(s.receivedTags, tag)
@@ -285,17 +240,18 @@ func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
 		// Send ACK for reliable messages
 		go s.sendAck(lane.ID, msgTag)
 	}
-
+	
 	// Create an arrival
 	arrival := &Arrival{
 		Message: message,
 		Breadcrumb: Breadcrumb{
-			Cy:        s.cy,
-			Priority:  lane.Priority,
+			Cy:         s.cy,
+			Priority:   lane.Priority,
 			RemoteID:   lane.ID,
 			TopicHash:  s.topic.hash,
 			MessageTag: msgTag,
-			Seqno:     0,
+			Seqno:      0,
+			UnicastCtx: lane.Context,
 		},
 	}
 
@@ -309,53 +265,18 @@ func (s *Subscriber) Deliver(message MessageTS, lane Lane) {
 	}
 }
 
-// sendAck sends an acknowledgment for a reliable message.
+// sendAck sends a positive acknowledgement for a reliable message (C header_msg_ack).
 func (s *Subscriber) sendAck(remoteID uint64, tag uint64) {
-	// Create an ACK message
-	ack := &ACKMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageACK),
-		},
-		Tag:          tag,
-		SourceNodeID: 0, // Would be the local node ID
-	}
-	
-	// Marshal the ACK message
-	ackData := ack.MarshalBinary()
-	
-	// Send via unicast to the remote node
-	lane := Lane{
-		ID:       remoteID,
-		Priority: PriorityNominal,
-	}
-	
-	// Send the ACK message
-	_ = s.cy.platform.Unicast(lane, s.cy.Now()+100000, ackData)
+	header := NewACKHeader(true, s.topic.Hash(), tag)
+	lane := Lane{ID: remoteID, Priority: PriorityNominal}
+	_ = s.cy.platform.Unicast(lane, s.cy.Now()+100000, header.MarshalBinary())
 }
 
-// sendNack sends a negative acknowledgment for a missing message.
+// sendNack sends a negative acknowledgement for a missing message (C header_msg_nack).
 func (s *Subscriber) sendNack(remoteID uint64, tag uint64) {
-	// Create a NACK message
-	nack := &NACKMessage{
-		Header: ProtocolHeader{
-			MessageType: uint8(ProtocolMessageNACK),
-		},
-		Tag:          tag,
-		SourceNodeID: 0, // Would be the local node ID
-		ErrorCode:    ErrNACK, // Indicate missing message
-	}
-	
-	// Marshal the NACK message
-	nackData := nack.MarshalBinary()
-	
-	// Send via unicast to the remote node
-	lane := Lane{
-		ID:       remoteID,
-		Priority: PriorityNominal,
-	}
-	
-	// Send the NACK message
-	_ = s.cy.platform.Unicast(lane, s.cy.Now()+100000, nackData)
+	header := NewACKHeader(false, s.topic.Hash(), tag)
+	lane := Lane{ID: remoteID, Priority: PriorityNominal}
+	_ = s.cy.platform.Unicast(lane, s.cy.Now()+100000, header.MarshalBinary())
 }
 
 // IsPattern returns true if this is a pattern subscriber.

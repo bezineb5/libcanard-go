@@ -1,34 +1,76 @@
 // Package can provides a CAN transport layer implementation for Cyphal.
-// It uses the go.einride.tech/can library for CAN I/O.
+//
+// It is a faithful Pure-Go port of the C Cyphal/CAN transport (cy_can.c). Framing,
+// transfer reassembly, dedup, and the 16-bit/13-bit subject-ID split are delegated to
+// the sibling libcanard package (a Go port of OpenCyphal/libcanard). SocketCAN I/O is
+// performed through go.einride.tech/can, bridged via a small frameTransport shim so the
+// transport can be exercised without real CAN hardware.
 package can
 
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/opencyphal/cy-go"
+	"go.dw1.io/rapidhash"
 	"go.einride.tech/can"
 	"go.einride.tech/can/pkg/socketcan"
+
+	"github.com/bezineb5/libcanard-go"
 )
+
+// UnicastServiceID is the reserved Cyphal/CAN service-ID for v1.1 unicast transfers.
+const UnicastServiceID = 511
+
+// headerBytes is the fixed Cy session-layer header size (HEADER_BYTES in cy_can.c).
+const headerBytes = 24
+
+// frameTransport abstracts CAN frame I/O so the platform can run against real
+// SocketCAN or a mock in tests. It is satisfied by socketcan.Receiver/Transmitter.
+type frameTransport interface {
+	Receive() (can.Frame, error)
+	Transmit(frame can.Frame) error
+}
+
+// pending holds one reassembled transfer awaiting delivery to the Cy instance.
+type pending struct {
+	lane      cy.Lane
+	subjectID *uint32 // nil for unicast
+	message   *cy.MessageTS
+}
 
 // Platform implements the cy.Platform interface for CAN transport.
 type Platform struct {
-	cyInstance *cy.Cy
-	receiver   *socketcan.Receiver
-	transmitter *socketcan.Transmitter
-	ifaceCount uint8
-	txQueueCapacity int
-	filterCount    int
-	prngSeed       uint64
-	writers        map[uint32]*subjectWriter
-	readers        map[uint32]*subjectReader
-	unicastExtent   int
+	cy.PlatformBase
+
+	canard *libcanard.Canard
+
+	transport frameTransport
+	rxCh     chan can.Frame
+	closed   atomic.Bool
+
+	// mu guards the non-goroutine-safe *libcanard.Canard and the pending queue.
+	mu      sync.Mutex
+	pending []pending
+
+	// writers/readers keyed by subject-ID (Cy guarantees at most one of each per ID).
+	writers map[uint32]*subjectWriter
+	readers map[uint32]*subjectReader
+
+	// unicastTID holds the per-remote transfer-ID used for v1.1 unicast transfers.
+	unicastTID [libcanard.NodeIDMax + 1]uint8
+
+	// unicastExtent is the maximum size of incoming unicast transfers (service 511).
+	unicastExtent int
+
+	randState uint64
+
 	subjectIDModulus uint32
-	mu             sync.RWMutex
-	closed         bool
 }
 
 type subjectWriter struct {
@@ -40,7 +82,7 @@ func (w *subjectWriter) SubjectID() uint32 { return w.subjectID }
 
 type subjectReader struct {
 	subjectID uint32
-	extent   int
+	extent    int
 	platform  *Platform
 }
 
@@ -48,223 +90,468 @@ func (r *subjectReader) SubjectID() uint32    { return r.subjectID }
 func (r *subjectReader) Extent() int          { return r.extent }
 func (r *subjectReader) SetExtent(extent int) { r.extent = extent }
 
-// New creates a new CAN platform.
+// readerCtx is stored as the libcanard subscription UserContext so the OnMessage
+// callback can recover the subject-ID and (for 13-bit subjects) the phony header state.
+type readerCtx struct {
+	subjectID uint32
+	pinned    bool // 13-bit (headerless) subject
+	phony     [headerBytes]byte
+	phonyTag  uint64
+}
+
+// New creates a new CAN platform bound to the named SocketCAN interface.
 func New(ifaceName string, txQueueCapacity, filterCount int, prngSeed uint64) (*Platform, error) {
 	if ifaceName == "" {
 		return nil, errors.New("CAN interface name is required")
 	}
-
-	// Dial the CAN interface
 	conn, err := socketcan.Dial("can", ifaceName)
 	if err != nil {
 		return nil, err
 	}
+	transport := &socketcanTransport{
+		receiver:    socketcan.NewReceiver(conn),
+		transmitter: socketcan.NewTransmitter(conn),
+	}
+	return newPlatform(transport, txQueueCapacity, filterCount, prngSeed)
+}
+
+// socketcanTransport adapts socketcan.Receiver/Transmitter to frameTransport.
+type socketcanTransport struct {
+	receiver    *socketcan.Receiver
+	transmitter *socketcan.Transmitter
+}
+
+func (t *socketcanTransport) Receive() (can.Frame, error) {
+	if !t.receiver.Receive() {
+		if err := t.receiver.Err(); err != nil {
+			return can.Frame{}, err
+		}
+		return can.Frame{}, errors.New("socketcan receive closed")
+	}
+	return t.receiver.Frame(), nil
+}
+
+func (t *socketcanTransport) Transmit(frame can.Frame) error {
+	return t.transmitter.TransmitFrame(context.Background(), frame)
+}
+
+// newPlatform builds a platform from a frameTransport (real or mock).
+func newPlatform(transport frameTransport, txQueueCapacity, filterCount int, prngSeed uint64) (*Platform, error) {
+	if txQueueCapacity <= 0 {
+		txQueueCapacity = 256
+	}
+	if filterCount <= 0 {
+		filterCount = 0
+	}
 
 	p := &Platform{
-		ifaceCount:      1,
-		txQueueCapacity: txQueueCapacity,
-		filterCount:     filterCount,
-		prngSeed:        prngSeed,
-		writers:        make(map[uint32]*subjectWriter),
-		readers:        make(map[uint32]*subjectReader),
+		transport:        transport,
+		rxCh:             make(chan can.Frame, 1024),
+		writers:          make(map[uint32]*subjectWriter),
+		readers:          make(map[uint32]*subjectReader),
+		randState:        prngSeed,
 		subjectIDModulus: cy.SubjectIDModulus16bit,
 	}
 
-	// Create receiver and transmitter
-	p.receiver = socketcan.NewReceiver(conn)
-	p.transmitter = socketcan.NewTransmitter(conn)
+	p.canard, _ = libcanard.New(
+		libcanard.NewPlatform(p.now, p.tx, libcanard.FilterAcceptAll),
+		libcanard.NewDefaultMemSet(),
+		libcanard.IfaceBitmapAll,
+		txQueueCapacity,
+		prngSeed,
+		filterCount,
+	)
+	if p.canard == nil {
+		return nil, errors.New("libcanard init failed")
+	}
+	// go.einride.tech/can models Classic CAN (8-byte MTU). Force the Classic CAN
+	// MTU so libcanard emits wire frames compatible with it; otherwise it defaults
+	// to CAN FD (64-byte MTU) which can.Frame cannot carry.
+	p.canard.SetClassicCAN(true)
 
-	// Start receiving frames in a goroutine
-	go p.receiveLoop()
+	// Subscribe to service 511 for incoming v1.1 unicast transfers. The Cy session
+	// header is carried intact in the payload; the callback enqueues a unicast
+	// delivery (subjectID == nil) so HandleMessage routes it to handleUnicastMessage.
+	// A zero extent would make libcanard allocate an empty reassembly buffer, so use a
+	// non-zero default unless the application raised it via SetUnicastExtent.
+	ue := p.unicastExtent
+	if ue <= 0 {
+		ue = 256
+	}
+	if p.canard.SubscribeRequest(&libcanard.Subscription{}, UnicastServiceID, ue, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
+		OnMessage: func(self *libcanard.Subscription, timestamp int64, priority libcanard.Prio, sourceNodeID uint8, transferID uint8, payload libcanard.Payload) {
+			buf := copyPayload(&payload)
+			p.enqueueUnicast(sourceNodeID, priority, timestamp, buf)
+		},
+	}) == nil {
+		return nil, errors.New("libcanard unicast subscribe failed")
+	}
+
+	go p.recvLoop()
 	return p, nil
 }
 
-// Destroy cleans up the platform.
-func (p *Platform) Destroy() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return
+// now implements the libcanard Platform.Now callback.
+func (p *Platform) tx(self *libcanard.Canard, userContext any, deadline int64, ifaceIndex uint8, fd bool, extendedCANID uint32, canData []byte) bool {
+	_ = deadline
+	_ = ifaceIndex
+	var data can.Data
+	copy(data[:], canData)
+	frame := can.Frame{
+		ID:         extendedCANID,
+		Length:     uint8(len(canData)),
+		Data:       data,
+		IsExtended: true,
 	}
-	p.closed = true
-	p.receiver = nil
-	p.transmitter = nil
-	p.writers = nil
-	p.readers = nil
-	p.cyInstance = nil
+	if err := p.transport.Transmit(frame); err != nil {
+		return false
+	}
+	return true
 }
 
-func (p *Platform) receiveLoop() {
+func (p *Platform) ingest(frame can.Frame) {
+	data := frame.Data[:frame.Length]
+	p.canard.IngestFrame(time.Now().UnixMicro(), 0, frame.ID, data)
+}
+
+func (p *Platform) recvLoop() {
 	for {
-		p.mu.RLock()
-		closed := p.closed
-		receiver := p.receiver
-		p.mu.RUnlock()
-		if closed || receiver == nil {
+		frame, err := p.transport.Receive()
+		if err != nil {
 			return
 		}
-
-		if !receiver.Receive() {
-			// Error receiving
-			time.Sleep(10 * time.Millisecond)
-			continue
+		select {
+		case p.rxCh <- frame:
+		default:
 		}
-
-		frame := receiver.Frame()
-		p.processFrame(frame)
 	}
 }
 
-func (p *Platform) processFrame(frame can.Frame) {
-	subjectID := uint32(frame.ID & 0xFFFF)
-	priority := cy.Priority((frame.ID >> 16) & 0x07)
-
-	if (frame.ID>>16)&0x1FF == 511 {
-		// Unicast - ignore for now
+func (p *Platform) Destroy() {
+	if p.closed.Swap(true) {
 		return
 	}
-
-	p.handleMulticastFrame(frame, subjectID, priority)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.writers = nil
+	p.readers = nil
 }
 
-func (p *Platform) handleMulticastFrame(frame can.Frame, subjectID uint32, priority cy.Priority) {
-	p.mu.RLock()
-	cyInstance := p.cyInstance
-	p.mu.RUnlock()
-	if cyInstance == nil {
-		return
-	}
+// ---------------------------------------------------------------------------------------------------------------------
+// Multicast: subject writers.
+// ---------------------------------------------------------------------------------------------------------------------
 
-	data := make([]byte, frame.Length)
-	copy(data, frame.Data[:frame.Length])
-
-	message := cy.AcquireMessage()
-	message.SetData(data)
-
-	msgTS := cy.NewMessageTS(cy.Microsecond(time.Now().UnixMicro()), message)
-	lane := cy.Lane{Priority: priority}
-
-	cyInstance.HandleMessage(lane, &subjectID, *msgTS)
-	cy.ReleaseMessageTS(msgTS)
-}
-
+// NewSubjectWriter creates a new subject writer for the specified subject-ID.
 func (p *Platform) NewSubjectWriter(subjectID uint32) (cy.SubjectWriter, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.writers == nil {
 		return nil, cy.ErrArgument
 	}
-	if writer, ok := p.writers[subjectID]; ok {
-		return writer, nil
+	if w, ok := p.writers[subjectID]; ok {
+		return w, nil
 	}
-	writer := &subjectWriter{subjectID: subjectID, platform: p}
-	p.writers[subjectID] = writer
-	return writer, nil
+	w := &subjectWriter{subjectID: subjectID, platform: p}
+	p.writers[subjectID] = w
+	return w, nil
 }
 
+// DestroySubjectWriter destroys a subject writer. The Cy core owns the single
+// writer per subject-ID; this only clears the local handle so a later
+// NewSubjectWriter re-creates it.
 func (p *Platform) DestroySubjectWriter(writer cy.SubjectWriter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.writers == nil {
 		return
 	}
-	if sw, ok := writer.(*subjectWriter); ok {
-		delete(p.writers, sw.subjectID)
+	if w, ok := writer.(*subjectWriter); ok {
+		delete(p.writers, w.subjectID)
 	}
 }
 
+// SubjectWriterSend publishes a message on the subject. The data passed in already
+// carries the 24-byte Cy session header (prepended by the Cy layer in publishImpl).
+//
+// Faithful to cy_can.c v_subject_writer_send: a subject is carried over the 13-bit
+// (headerless) path iff it is pinned (subject-ID <= SubjectIDPinnedMax), best-effort
+// (header type == msg_be), and its header hash equals the compat topic hash for the
+// subject-ID (the N#N idiom). Otherwise it uses the 16-bit path with the header intact.
 func (p *Platform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Microsecond, priority cy.Priority, data []byte) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	w, ok := writer.(*subjectWriter)
+	if !ok || len(data) < headerBytes {
 		return cy.ErrArgument
 	}
-	sw, ok := writer.(*subjectWriter)
-	if !ok {
+	p.mu.Lock()
+	sid := uint16(w.subjectID)
+	pinned := w.subjectID <= cy.SubjectIDPinnedMax
+	bestEffort := data[0] == 0
+	use13b := pinned && bestEffort && topicIsCompatNamed(w.subjectID, data)
+	defer p.mu.Unlock()
+	if p.canard == nil {
 		return cy.ErrArgument
 	}
-	canID := p.encodeCANID(sw.subjectID, priority, false)
-	frame := can.Frame{
-		ID:        canID,
-		Length:    uint8(len(data)),
-		IsExtended: true,
+	var okTx bool
+	if use13b {
+		stripped := data[headerBytes:]
+		okTx = p.canard.Publish13b(int64(deadline), libcanard.IfaceBitmapAll, libcanard.Prio(priority), sid, 0, stripped, nil)
+	} else {
+		okTx = p.canard.Publish16b(int64(deadline), libcanard.IfaceBitmapAll, libcanard.Prio(priority), sid, 0, data, nil)
 	}
-	if len(data) > 0 {
-		copy(frame.Data[:], data)
+	if !okTx {
+		return cy.ErrMemory
 	}
-	p.transmitter.TransmitFrame(context.Background(), frame)
 	return nil
 }
 
+// topicIsCompatNamed mirrors cy_can.c topic_is_compat_named: true iff the outgoing
+// header's hash field (bytes 8..16) equals the compat topic hash for the subject-ID.
+func topicIsCompatNamed(sid uint32, header []byte) bool {
+	want := compatTopicHash(sid)
+	got := uint64(header[8]) | uint64(header[9])<<8 | uint64(header[10])<<16 | uint64(header[11])<<24 |
+		uint64(header[12])<<32 | uint64(header[13])<<40 | uint64(header[14])<<48 | uint64(header[15])<<56
+	return got == want
+}
+
+// compatTopicHash mirrors cy_can.c compat_topic_hash: rapidhash of the subject-ID's
+// decimal spelling. This MUST agree with the 13-bit RX phony header and with a pinned
+// topic's hash in the Cy layer (a pinned topic named "1234" hashes to rapidhash("1234")).
+func compatTopicHash(sid uint32) uint64 {
+	return rapidhash.Hash([]byte(strconv.FormatUint(uint64(sid), 10)))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Multicast: subject readers.
 func (p *Platform) NewSubjectReader(subjectID uint32, extent int) (cy.SubjectReader, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.readers == nil {
 		return nil, cy.ErrArgument
 	}
-	if reader, ok := p.readers[subjectID]; ok {
-		return reader, nil
+	if r, ok := p.readers[subjectID]; ok {
+		return r, nil
 	}
-	reader := &subjectReader{subjectID: subjectID, extent: extent, platform: p}
-	p.readers[subjectID] = reader
-	return reader, nil
+	sid := uint16(subjectID)
+	ctx := &readerCtx{subjectID: subjectID, pinned: subjectID <= cy.SubjectIDPinnedMax}
+	if ctx.pinned {
+		buildPhonyHeader(&ctx.phony, subjectID)
+	}
+
+	// libcanard's rxSubscribe resets sub.UserContext, so capture ctx in the closure
+	// rather than relying on the subscription's UserContext field.
+	on16 := func(self *libcanard.Subscription, timestamp int64, priority libcanard.Prio, sourceNodeID uint8, transferID uint8, payload libcanard.Payload) {
+		buf := copyPayload(&payload)
+		p.enqueue(ctx.subjectID, sourceNodeID, priority, timestamp, buf)
+	}
+	if p.canard.Subscribe16b(&libcanard.Subscription{}, sid, extent, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
+		OnMessage: on16,
+	}) == nil {
+		return nil, cy.ErrArgument
+	}
+	if ctx.pinned {
+		extent13 := extent
+		if extent13 > headerBytes {
+			extent13 -= headerBytes
+		}
+		on13 := func(self *libcanard.Subscription, timestamp int64, priority libcanard.Prio, sourceNodeID uint8, transferID uint8, payload libcanard.Payload) {
+			ctx.phonyTag++
+			buf := make([]byte, headerBytes+libcanardPayloadLen(&payload))
+			copy(buf[:headerBytes], ctx.phony[:])
+			binaryLEPutUint64(buf[16:24], ctx.phonyTag)
+			copyPayloadInto(&payload, buf[headerBytes:])
+			p.enqueue(ctx.subjectID, sourceNodeID, priority, timestamp, buf)
+		}
+		if p.canard.Subscribe13b(&libcanard.Subscription{}, sid, extent13, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
+			OnMessage: on13,
+		}) == nil {
+			return nil, cy.ErrArgument
+		}
+	}
+	r := &subjectReader{subjectID: subjectID, extent: extent, platform: p}
+	p.readers[subjectID] = r
+	return r, nil
 }
 
+// DestroySubjectReader destroys a subject reader. libcanard does not expose an
+// unsubscribe primitive, so we detach the local handle and rely on instance
+// teardown to release the subscription; the Cy core owns the single reader per
+// subject-ID and issues a final Destroy on teardown.
 func (p *Platform) DestroySubjectReader(reader cy.SubjectReader) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
+	r, ok := reader.(*subjectReader)
+	if !ok {
 		return
 	}
-	if sr, ok := reader.(*subjectReader); ok {
-		delete(p.readers, sr.subjectID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.readers == nil {
+		return
 	}
+	delete(p.readers, r.subjectID)
 }
 
+// SetSubjectReaderExtent updates the maximum extent of incoming messages.
 func (p *Platform) SetSubjectReaderExtent(reader cy.SubjectReader, extent int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return
-	}
-	if sr, ok := reader.(*subjectReader); ok {
-		sr.extent = extent
+	if r, ok := reader.(*subjectReader); ok {
+		r.extent = extent
 	}
 }
 
+// buildPhonyHeader mirrors cy_can.c build_phony_header: the fabricated Cy session
+// header imputed to a headerless 13-bit subject.
+func buildPhonyHeader(out *[headerBytes]byte, sid uint32) {
+	for i := range out {
+		out[i] = 0
+	}
+	out[3] = 0xFF // lage = -1 (int8_t)
+	ev := uint32(^uint32(0) - sid)
+	out[4] = byte(ev)
+	out[5] = byte(ev >> 8)
+	out[6] = byte(ev >> 16)
+	out[7] = byte(ev >> 24)
+	h := compatTopicHash(sid)
+	for i := 0; i < 8; i++ {
+		out[8+i] = byte(h >> (8 * uint(i)))
+	}
+}
+
+// enqueue appends a pending delivery under p.mu. Called from within libcanard
+// callbacks, so it must not reenter the library.
+func (p *Platform) enqueue(subjectID uint32, src uint8, prio libcanard.Prio, ts int64, buf []byte) {
+	lane := cy.Lane{
+		ID:       uint64(src),
+		Priority: cy.Priority(prio),
+	}
+	lane.Context[0] = src // mirrors C lane->ctx.state[0] = remote node-ID
+	sid := subjectID
+	p.pending = append(p.pending, pending{
+		lane:      lane,
+		subjectID: &sid,
+		message:   cy.NewMessageTS(cy.Microsecond(ts), cy.NewMessage(buf)),
+	})
+}
+
+// enqueueUnicast appends a pending unicast delivery (subjectID == nil) so the Cy
+// instance routes it to handleUnicastMessage. Remote node-ID goes in lane.ID and
+// lane.Context[0], mirroring the multicast path.
+func (p *Platform) enqueueUnicast(src uint8, prio libcanard.Prio, ts int64, buf []byte) {
+	lane := cy.Lane{
+		ID:       uint64(src),
+		Priority: cy.Priority(prio),
+	}
+	lane.Context[0] = src
+	p.pending = append(p.pending, pending{
+		lane:      lane,
+		subjectID: nil,
+		message:   cy.NewMessageTS(cy.Microsecond(ts), cy.NewMessage(buf)),
+	})
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Unicast.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Unicast sends a unicast transfer to the specified remote node via service 511.
+// Mirrors cy_can.c v_unicast_send: a per-remote transfer-ID counter modulo 32.
 func (p *Platform) Unicast(lane cy.Lane, deadline cy.Microsecond, data []byte) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	remote := lane.ID
+	if remote > libcanard.NodeIDMax || remote == 0 {
 		return cy.ErrArgument
 	}
-	canID := p.encodeCANID(511, lane.Priority, true)
-	frame := can.Frame{
-		ID:        canID,
-		Length:    uint8(len(data)),
-		IsExtended: true,
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.canard == nil {
+		return cy.ErrArgument
 	}
-	if len(data) > 0 {
-		copy(frame.Data[:], data)
+	tid := p.unicastTID[remote]
+	p.unicastTID[remote] = uint8((uint32(tid) + 1) % libcanard.TransferIDModulo)
+	ok := p.canard.Request(int64(deadline), libcanard.Prio(lane.Priority), UnicastServiceID, uint8(remote), tid, data, nil)
+	if !ok {
+		return cy.ErrMemory
 	}
-	p.transmitter.TransmitFrame(context.Background(), frame)
 	return nil
 }
 
+// SetUnicastExtent sets the maximum extent of incoming unicast transfers.
 func (p *Platform) SetUnicastExtent(extent int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.unicastExtent = extent
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Event loop.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Spin runs the event loop until the deadline, ingesting received frames, flushing
+// the TX queue, and delivering reassembled transfers to the Cy instance.
 func (p *Platform) Spin(deadline cy.Microsecond) error {
-	return cy.OK
+	for {
+		// Drain any frames already buffered from the receive loop. This must happen
+		// before the deadline check: frames that arrived after the previous poll but
+		// before this call would otherwise sit un-ingested if the deadline already passed.
+		select {
+		case frame, ok := <-p.rxCh:
+			if !ok {
+				return nil
+			}
+			p.mu.Lock()
+			p.ingest(frame)
+			p.mu.Unlock()
+			continue
+		default:
+		}
+
+		remaining := deadline - p.Now()
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case frame, ok := <-p.rxCh:
+			if !ok {
+				return nil
+			}
+			p.mu.Lock()
+			p.ingest(frame)
+			p.mu.Unlock()
+		case <-time.After(time.Duration(remaining) * time.Microsecond):
+			goto drain
+		}
+	}
+drain:
+	p.mu.Lock()
+	p.canard.Poll(libcanard.IfaceBitmapAll)
+	pending := p.pending
+	p.pending = nil
+	p.mu.Unlock()
+	// Deliver outside the lock: the Cy handler may re-enter the platform
+	// (e.g. ACK -> Unicast -> canard.Request).
+	onMsg := p.PlatformBase.OnMessage
+	if onMsg == nil {
+		return nil
+	}
+	for i := range pending {
+		pd := pending[i]
+		onMsg(pd.lane, pd.subjectID, *pd.message)
+	}
+	return nil
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Misc platform callbacks.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// now implements the libcanard Platform.Now callback (func(*Canard) int64).
+// Now (below) implements the cy.Platform interface (func() Microsecond).
+func (p *Platform) now(self *libcanard.Canard) int64 {
+	return time.Now().UnixMicro()
+}
+
+// Now returns the current monotonic time in microseconds.
 func (p *Platform) Now() cy.Microsecond {
 	return cy.Microsecond(time.Now().UnixMicro())
 }
 
+// Realloc reallocates memory.
 func (p *Platform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 	if size == 0 {
 		return nil
@@ -279,38 +566,53 @@ func (p *Platform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 	return unsafe.Pointer(&newSlice[0])
 }
 
+// Random returns a deterministic 64-bit pseudo-random value (LCG).
 func (p *Platform) Random() uint64 {
-	p.prngSeed = p.prngSeed*6364136223846793005 + 1
-	return p.prngSeed
+	prev := atomic.LoadUint64(&p.randState)
+	next := prev*6364136223846793005 + 1442695040888963407
+	atomic.StoreUint64(&p.randState, next)
+	return next
 }
 
+// SetCy sets the Cy instance reference (called by cy.New).
 func (p *Platform) SetCy(cyInstance *cy.Cy) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cyInstance = cyInstance
+	p.PlatformBase.Cy = cyInstance
 }
 
-func (p *Platform) encodeCANID(subjectID uint32, priority cy.Priority, unicast bool) uint32 {
-	canID := subjectID & 0xFFFF
-	canID |= uint32(priority) << 16
-	if unicast {
-		canID |= 511 << 16
+// ---------------------------------------------------------------------------------------------------------------------
+// Payload helpers (libcanard.Payload lifetime ends on return from OnMessage).
+// ---------------------------------------------------------------------------------------------------------------------
+
+func libcanardPayloadLen(payload *libcanard.Payload) int {
+	return payload.View.Size
+}
+
+func copyPayload(payload *libcanard.Payload) []byte {
+	if payload.View.Size <= 0 {
+		return nil
 	}
-	return canID
+	src := unsafe.Slice((*byte)(payload.View.Data), payload.View.Size)
+	out := make([]byte, payload.View.Size)
+	copy(out, src)
+	return out
 }
 
-// Frame returns the last received frame from the receiver.
-// This is a helper for debugging.
-func (p *Platform) Frame() can.Frame {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.receiver != nil {
-		return p.receiver.Frame()
+func copyPayloadInto(payload *libcanard.Payload, dst []byte) {
+	if payload.View.Size <= 0 {
+		return
 	}
-	return can.Frame{}
+	src := unsafe.Slice((*byte)(payload.View.Data), payload.View.Size)
+	n := copy(dst, src)
+	_ = n
 }
 
-// Ensure interfaces are satisfied
+func binaryLEPutUint64(buf []byte, v uint64) {
+	for i := 0; i < 8; i++ {
+		buf[i] = byte(v >> (8 * uint(i)))
+	}
+}
+
+// Ensure interfaces are satisfied.
 var _ cy.Platform = (*Platform)(nil)
 var _ cy.SubjectWriter = (*subjectWriter)(nil)
 var _ cy.SubjectReader = (*subjectReader)(nil)

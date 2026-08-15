@@ -128,6 +128,13 @@ type PlatformBase struct {
 	UnicastExtent int
 }
 
+// SetOnMessage installs the Cy message callback. It exists so that platforms
+// embedding PlatformBase (rather than being a bare *PlatformBase) can be wired
+// up from cy.New without a fragile type assertion.
+func (p *PlatformBase) SetOnMessage(cb OnMessageCallback) {
+	p.OnMessage = cb
+}
+
 // NewSubjectWriter creates a new subject writer (default implementation returns error).
 func (p *PlatformBase) NewSubjectWriter(subjectID uint32) (SubjectWriter, error) {
 	return nil, ErrArgument

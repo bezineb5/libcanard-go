@@ -8,94 +8,105 @@ import (
 // This matches HEADER_BYTES in the C implementation (24 bytes).
 const HeaderSize = 24
 
-// Header represents the Cyphal session layer header.
-// This is prepended to all application messages before transmission.
-// The header format is designed to be parsed efficiently and to provide
-// all necessary information for the session layer protocol.
+// HeaderType enumerates the message-type byte carried at offset 0 of every
+// Cyphal session-layer header. It matches the C header_type_t enum exactly so
+// that the Go and C implementations are wire-compatible.
+type HeaderType uint8
+
+const (
+	HeaderTypeMsgBE   HeaderType = 0 // Best-effort multicast/unicast message.
+	HeaderTypeMsgRel  HeaderType = 1 // Reliable message.
+	HeaderTypeMsgAck  HeaderType = 2 // Positive acknowledgement (unicast only).
+	HeaderTypeMsgNack HeaderType = 3 // Negative acknowledgement (unicast only).
+	HeaderTypeRspBE   HeaderType = 4 // Best-effort response (unicast only).
+	HeaderTypeRspRel  HeaderType = 5 // Reliable response (unicast only).
+	HeaderTypeRspAck  HeaderType = 6 // Response acknowledgement (unicast only).
+	HeaderTypeRspNack HeaderType = 7 // Response negative acknowledgement (unicast only).
+	HeaderTypeGossip HeaderType = 8 // Topic-allocation CRDT gossip.
+	HeaderTypeScout  HeaderType = 9 // Discovery scout.
+)
+
+// Header represents the Cyphal session layer header (cy_message_header_t).
+// It is prepended to every application message before transmission and is
+// always skipped on reception. The byte layout is fixed and little-endian:
+//
+//	[0]      type (HeaderType)
+//	[1]      reserved (always 0)
+//	[2]      incompatibility flag (0 for compatible)
+//	[3]      lage (log-age, signed) -- for msg types; 0 for ack/rsp
+//	[4:8]    evictions (u32 LE) -- for msg/gossip/scout; 0 for ack/rsp
+//	[8:16]   hash (u64 LE) -- topic hash or service hash
+//	[16:24]  tag/evictions2/size -- type-dependent; for msg: message tag
 type Header struct {
-	// Tag is a unique identifier for this message.
-	// Used for reliable delivery tracking and deduplication.
+	// Type is the message-type byte (HeaderType).
+	Type HeaderType
+	// Incompat is the incompatibility flag; must be 0 on the wire.
+	Incompat byte
+	// Reserved is byte[1], always 0.
+	Reserved byte
+	// Lage is the log-age (signed) for message/gossip/scout headers.
+	Lage int8
+	// Evictions is the CRDT eviction counter (msg/gossip/scout) or reserved.
+	Evictions uint32
+	// Hash is the topic/service hash.
+	Hash uint64
+	// Tag is the message tag (msg/ack/rsp) or the trailing field per type.
 	Tag uint64
-	
-	// SequenceNumber is used for ordered messages.
-	// Incremented for each message sent on a topic.
-	SequenceNumber uint64
-	
-	// Timestamp is the message timestamp in microseconds.
-	// This is optional and may be zero if not used.
-	Timestamp Microsecond
-	
-	// Priority is the message priority.
-	Priority Priority
-	
-	// SourceNodeID is the unique identifier of the source node.
-	// This is used for routing responses.
-	SourceNodeID uint64
-	
-	// Reserved bytes for future use.
-	Reserved [4]byte
 }
 
-// NewHeader creates a new header with the specified values.
-func NewHeader(tag uint64, seqno uint64, timestamp Microsecond, priority Priority, sourceNodeID uint64) *Header {
+// NewHeader creates a new header with the common fields.
+// lage/evictions/hash/tag are set per the C do_publish_impl layout; the caller
+// may override fields after construction for ack/rsp/gossip/scout variants.
+func NewHeader(headerType HeaderType, lage int8, evictions uint32, hash, tag uint64) *Header {
 	return &Header{
-		Tag:          tag,
-		SequenceNumber: seqno,
-		Timestamp:    timestamp,
-		Priority:     priority,
-		SourceNodeID:  sourceNodeID,
+		Type:      headerType,
+		Incompat:  0,
+		Reserved:  0,
+		Lage:      lage,
+		Evictions: evictions,
+		Hash:      hash,
+		Tag:       tag,
 	}
 }
 
-// MarshalBinary encodes the header into binary form.
-// The format is little-endian for compatibility with the C implementation.
+// MarshalBinary encodes the header into the C-compatible 24-byte wire form.
 func (h *Header) MarshalBinary() []byte {
 	buf := make([]byte, HeaderSize)
-	
-	// Tag (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[0:8], h.Tag)
-	
-	// SequenceNumber (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[8:16], h.SequenceNumber)
-	
-	// Timestamp (8 bytes, little-endian, signed)
-	// We use int64 for timestamp
-	binary.LittleEndian.PutUint64(buf[16:24], uint64(h.Timestamp))
-	
+	buf[0] = byte(h.Type)
+	buf[1] = h.Reserved
+	buf[2] = h.Incompat
+	buf[3] = byte(h.Lage)
+	binary.LittleEndian.PutUint32(buf[4:8], h.Evictions)
+	binary.LittleEndian.PutUint64(buf[8:16], h.Hash)
+	binary.LittleEndian.PutUint64(buf[16:24], h.Tag)
 	return buf
 }
 
-// UnmarshalBinary decodes a header from binary form.
+// UnmarshalBinary decodes the C-compatible 24-byte wire form.
 func (h *Header) UnmarshalBinary(data []byte) error {
 	if len(data) < HeaderSize {
 		return ErrArgument
 	}
-	
-	// Tag
-	h.Tag = binary.LittleEndian.Uint64(data[0:8])
-	
-	// SequenceNumber
-	h.SequenceNumber = binary.LittleEndian.Uint64(data[8:16])
-	
-	// Timestamp
-	h.Timestamp = Microsecond(int64(binary.LittleEndian.Uint64(data[16:24])))
-	
+	h.Type = HeaderType(data[0])
+	h.Reserved = data[1]
+	h.Incompat = data[2]
+	h.Lage = int8(data[3])
+	h.Evictions = binary.LittleEndian.Uint32(data[4:8])
+	h.Hash = binary.LittleEndian.Uint64(data[8:16])
+	h.Tag = binary.LittleEndian.Uint64(data[16:24])
 	return nil
 }
 
 // ParseHeader parses a header from the beginning of a byte slice.
-// Returns the header and the remaining payload.
+// Returns the header and the remaining payload (header stripped).
 func ParseHeader(data []byte) (*Header, []byte, error) {
 	if len(data) < HeaderSize {
 		return nil, nil, ErrArgument
 	}
-	
 	header := &Header{}
-	err := header.UnmarshalBinary(data[:HeaderSize])
-	if err != nil {
+	if err := header.UnmarshalBinary(data[:HeaderSize]); err != nil {
 		return nil, nil, err
 	}
-	
 	return header, data[HeaderSize:], nil
 }
 
@@ -110,447 +121,123 @@ func PrependHeader(header *Header, payload []byte) []byte {
 }
 
 // ExtractHeader extracts the header from a message and returns the payload.
-// This is used when receiving messages.
+// Reads the first HeaderSize bytes via absolute offset 0, so it is safe to call
+// after a prior Skip (which only moves the skip offset used for subsequent
+// Read/Payload calls).
 func ExtractHeader(message *Message) (*Header, []byte, error) {
 	if message.Size() < HeaderSize {
 		return nil, nil, ErrArgument
 	}
-	
-	// Read the header data
 	headerData := make([]byte, HeaderSize)
 	n := message.Read(0, HeaderSize, headerData)
 	if n != HeaderSize {
 		return nil, nil, ErrArgument
 	}
-	
-	// Parse the header
 	header := &Header{}
-	err := header.UnmarshalBinary(headerData)
-	if err != nil {
+	if err := header.UnmarshalBinary(headerData); err != nil {
 		return nil, nil, err
 	}
-	
-	// Get the payload
-	payload := make([]byte, message.Size()-HeaderSize)
-	n = message.Read(HeaderSize, message.Size()-HeaderSize, payload)
-	if n != len(payload) {
-		return nil, nil, ErrArgument
+	return header, message.Payload()[HeaderSize:], nil
+}
+
+// =====================================================================================================================
+// Wire-compatible acknowledgement and response messages.
+//
+// In the C implementation these are carried inside the 24-byte cy_message_header_t:
+//   - ACK/NACK  (unicast):  type=2/3, [8:16]=topic_hash, [16:24]=message_tag          (evictions[4:8]=0)
+//   - RSP       (unicast):  type=4/5, [8:16]=service_hash, [16:24]=message_tag,
+//                          [1]=tag, [2:8]=seqno(u48 LE)                            (evictions[4:8]=0)
+//   - RSP ACK   (unicast):  type=6/7, [8:16]=hash, [16:24]=message_tag, [1]=tag, [2:8]=seqno
+// The following helpers build/parse those headers directly so callers never
+// construct a stray 4-byte protocol header.
+
+// NewACKHeader builds an ACK/NACK header (C header_msg_ack / header_msg_nack).
+func NewACKHeader(positive bool, topicHash, tag uint64) *Header {
+	t := HeaderTypeMsgAck
+	if !positive {
+		t = HeaderTypeMsgNack
 	}
-	
-	return header, payload, nil
+	return &Header{Type: t, Hash: topicHash, Tag: tag}
 }
 
-// ProtocolMessageType represents the type of protocol messages.
-type ProtocolMessageType uint8
-
-// Protocol Message Types
-const (
-	// ProtocolMessageGossip indicates a gossip message.
-	ProtocolMessageGossip ProtocolMessageType = iota
-	// ProtocolMessageACK indicates an acknowledgment message.
-	ProtocolMessageACK
-	// ProtocolMessageNACK indicates a negative acknowledgment message.
-	ProtocolMessageNACK
-	// ProtocolMessageRequest indicates a request message.
-	ProtocolMessageRequest
-	// ProtocolMessageResponse indicates a response message.
-	ProtocolMessageResponse
-)
-
-// ProtocolHeader represents the header for protocol messages.
-// Protocol messages have a different header format than application messages.
-type ProtocolHeader struct {
-	// MessageType indicates the type of protocol message.
-	MessageType uint8
-	
-	// Reserved bytes.
-	Reserved [3]byte
-	
-	// Payload follows
-}
-
-// ProtocolHeaderSize is the size of the protocol header.
-const ProtocolHeaderSize = 4
-
-// MarshalBinary encodes the protocol header.
-func (h *ProtocolHeader) MarshalBinary() []byte {
-	return []byte{
-		h.MessageType,
-		h.Reserved[0],
-		h.Reserved[1],
-		h.Reserved[2],
+// MarshalRSPHeader builds a response header (C header_rsp_be / header_rsp_rel) as the
+// exact 24-byte wire form. Layout (must match cy.c do_respond):
+//
+//	[0]      = type (HeaderTypeRspBE / HeaderTypeRspRel)
+//	[1]      = tag (small response tag, 0..255)
+//	[2:8]    = seqno (u48 LE)
+//	[8:16]   = service/topic hash
+//	[16:24]  = message_tag (u64 LE) -- the original request's message tag
+func MarshalRSPHeader(reliable bool, tag byte, seqno, serviceHash, messageTag uint64) []byte {
+	t := byte(HeaderTypeRspBE)
+	if reliable {
+		t = byte(HeaderTypeRspRel)
 	}
+	return marshalResponseHeader(t, tag, seqno, serviceHash, messageTag)
 }
 
-// UnmarshalBinary decodes a protocol header.
-func (h *ProtocolHeader) UnmarshalBinary(data []byte) error {
-	if len(data) < ProtocolHeaderSize {
-		return ErrArgument
+// MarshalRSPACKHeader builds a response acknowledgement (C header_rsp_ack / header_rsp_nack).
+// Layout matches cy.c send_response_ack:
+//
+//	[0]      = type (HeaderTypeRspAck / HeaderTypeRspNack)
+//	[1]      = tag
+//	[2:8]    = seqno (u48 LE)
+//	[8:16]   = hash
+//	[16:24]  = message_tag
+func MarshalRSPACKHeader(positive bool, tag byte, seqno, hash, messageTag uint64) []byte {
+	t := byte(HeaderTypeRspAck)
+	if !positive {
+		t = byte(HeaderTypeRspNack)
 	}
-	
-	h.MessageType = data[0]
-	h.Reserved[0] = data[1]
-	h.Reserved[1] = data[2]
-	h.Reserved[2] = data[3]
-	
-	return nil
+	return marshalResponseHeader(t, tag, seqno, hash, messageTag)
 }
 
-// GossipMessage represents a gossip message for topic discovery.
-// Gossip messages contain the CRDT state of topics.
-type GossipMessage struct {
-	// Header is the protocol header.
-	Header ProtocolHeader
-	
-	// Hash is the hash of the topic name.
-	Hash uint64
-	
-	// LogAge is the log2 of seconds since topic creation.
-	LogAge int32
-	
-	// Evictions is the number of times the topic has been evicted and recreated.
-	Evictions uint32
-}
-
-// GossipMessageSize is the total size of a gossip message.
-const GossipMessageSize = ProtocolHeaderSize + 8 + 4 + 4 // 20 bytes
-
-// MarshalBinary encodes a gossip message.
-func (g *GossipMessage) MarshalBinary() []byte {
-	buf := make([]byte, GossipMessageSize)
-	
-	// Protocol header
-	buf[0] = byte(ProtocolMessageGossip)
-	
-	// Hash (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[4:12], g.Hash)
-	
-	// LogAge (4 bytes, little-endian, signed)
-	binary.LittleEndian.PutUint32(buf[12:16], uint32(g.LogAge))
-	
-	// Evictions (4 bytes, little-endian)
-	binary.LittleEndian.PutUint32(buf[16:20], g.Evictions)
-	
+func marshalResponseHeader(typ byte, tag byte, seqno, hash, messageTag uint64) []byte {
+	buf := make([]byte, HeaderSize)
+	buf[0] = typ
+	buf[1] = tag
+	// seqno is a 48-bit little-endian integer occupying bytes [2:8].
+	binary.LittleEndian.PutUint64(buf[2:], seqno) // writes 8 bytes; bytes [8:10] overwritten below
+	// Clear the top 16 bits that spilled into the hash region.
+	buf[8] = 0
+	buf[9] = 0
+	binary.LittleEndian.PutUint64(buf[8:], hash)
+	binary.LittleEndian.PutUint64(buf[16:], messageTag)
 	return buf
 }
 
-// UnmarshalBinary decodes a gossip message.
-func (g *GossipMessage) UnmarshalBinary(data []byte) error {
-	if len(data) < GossipMessageSize {
-		return ErrArgument
+// ParsedResponseHeader is the decoded form of a C-compatible response/response-ack header.
+type ParsedResponseHeader struct {
+	Type       HeaderType
+	Reliable   bool
+	Tag        byte
+	Seqno      uint64
+	Hash       uint64
+	MessageTag uint64
+}
+
+// ParseResponseHeader decodes a 24-byte response (or response-ack) header.
+// It assumes the buffer is at least HeaderSize bytes and the type byte is one of
+// HeaderTypeRspBE / HeaderTypeRspRel / HeaderTypeRspAck / HeaderTypeRspNack.
+func ParseResponseHeader(data []byte) (ParsedResponseHeader, error) {
+	if len(data) < HeaderSize {
+		return ParsedResponseHeader{}, ErrArgument
 	}
-	
-	// Protocol header
-	g.Header.MessageType = data[0]
-	
-	// Hash
-	g.Hash = binary.LittleEndian.Uint64(data[4:12])
-	
-	// LogAge
-	g.LogAge = int32(binary.LittleEndian.Uint32(data[12:16]))
-	
-	// Evictions
-	g.Evictions = binary.LittleEndian.Uint32(data[16:20])
-	
-	return nil
-}
-
-// ACKMessage represents an acknowledgment message for reliable delivery.
-type ACKMessage struct {
-	// Header is the protocol header.
-	Header ProtocolHeader
-	
-	// Tag is the message tag being acknowledged.
-	Tag uint64
-	
-	// SourceNodeID is the node ID sending the ACK.
-	SourceNodeID uint64
-}
-
-// ACKMessageSize is the total size of an ACK message.
-const ACKMessageSize = ProtocolHeaderSize + 8 + 8 // 20 bytes
-
-// MarshalBinary encodes an ACK message.
-func (a *ACKMessage) MarshalBinary() []byte {
-	buf := make([]byte, ACKMessageSize)
-	
-	// Protocol header
-	buf[0] = byte(ProtocolMessageACK)
-	
-	// Tag (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[4:12], a.Tag)
-	
-	// SourceNodeID (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[12:20], a.SourceNodeID)
-	
-	return buf
-}
-
-// UnmarshalBinary decodes an ACK message.
-func (a *ACKMessage) UnmarshalBinary(data []byte) error {
-	if len(data) < ACKMessageSize {
-		return ErrArgument
-	}
-	
-	// Protocol header
-	a.Header.MessageType = data[0]
-	
-	// Tag
-	a.Tag = binary.LittleEndian.Uint64(data[4:12])
-	
-	// SourceNodeID
-	a.SourceNodeID = binary.LittleEndian.Uint64(data[12:20])
-	
-	return nil
-}
-
-// NACKMessage represents a negative acknowledgment message.
-type NACKMessage struct {
-	// Header is the protocol header.
-	Header ProtocolHeader
-	
-	// Tag is the message tag being negatively acknowledged.
-	Tag uint64
-	
-	// SourceNodeID is the node ID sending the NACK.
-	SourceNodeID uint64
-	
-	// ErrorCode indicates the reason for the NACK.
-	ErrorCode Error
-}
-
-// NACKMessageSize is the total size of a NACK message.
-const NACKMessageSize = ProtocolHeaderSize + 8 + 8 + 1 // 21 bytes
-
-// MarshalBinary encodes a NACK message.
-func (n *NACKMessage) MarshalBinary() []byte {
-	buf := make([]byte, NACKMessageSize)
-	
-	// Protocol header
-	buf[0] = byte(ProtocolMessageNACK)
-	
-	// Tag (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[4:12], n.Tag)
-	
-	// SourceNodeID (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[12:20], n.SourceNodeID)
-	
-	// ErrorCode (1 byte)
-	buf[20] = byte(n.ErrorCode)
-	
-	return buf
-}
-
-// UnmarshalBinary decodes a NACK message.
-func (n *NACKMessage) UnmarshalBinary(data []byte) error {
-	if len(data) < NACKMessageSize {
-		return ErrArgument
-	}
-	
-	// Protocol header
-	n.Header.MessageType = data[0]
-	
-	// Tag
-	n.Tag = binary.LittleEndian.Uint64(data[4:12])
-	
-	// SourceNodeID
-	n.SourceNodeID = binary.LittleEndian.Uint64(data[12:20])
-	
-	// ErrorCode
-	n.ErrorCode = Error(data[20])
-	
-	return nil
-}
-
-// RequestMessage represents a request message for RPC.
-type RequestMessage struct {
-	// Header is the protocol header.
-	Header ProtocolHeader
-	
-	// Tag is the unique request tag.
-	Tag uint64
-	
-	// SourceNodeID is the node ID sending the request.
-	SourceNodeID uint64
-	
-	// ServiceID is the subject-ID of the service being called.
-	ServiceID uint32
-	
-	// RequestID is a unique identifier for this request within the tag.
-	RequestID uint32
-}
-
-// RequestMessageSize is the total size of a request message.
-const RequestMessageSize = ProtocolHeaderSize + 8 + 8 + 4 + 4 // 24 bytes
-
-// MarshalBinary encodes a request message.
-func (r *RequestMessage) MarshalBinary() []byte {
-	buf := make([]byte, RequestMessageSize)
-	
-	// Protocol header
-	buf[0] = byte(ProtocolMessageRequest)
-	
-	// Tag (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[4:12], r.Tag)
-	
-	// SourceNodeID (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[12:20], r.SourceNodeID)
-	
-	// ServiceID (4 bytes, little-endian)
-	binary.LittleEndian.PutUint32(buf[20:24], r.ServiceID)
-	
-	// RequestID (4 bytes, little-endian)
-	binary.LittleEndian.PutUint32(buf[24:28], r.RequestID)
-	
-	return buf
-}
-
-// UnmarshalBinary decodes a request message.
-func (r *RequestMessage) UnmarshalBinary(data []byte) error {
-	if len(data) < RequestMessageSize {
-		return ErrArgument
-	}
-	
-	// Protocol header
-	r.Header.MessageType = data[0]
-	
-	// Tag
-	r.Tag = binary.LittleEndian.Uint64(data[4:12])
-	
-	// SourceNodeID
-	r.SourceNodeID = binary.LittleEndian.Uint64(data[12:20])
-	
-	// ServiceID
-	r.ServiceID = binary.LittleEndian.Uint32(data[20:24])
-	
-	// RequestID
-	r.RequestID = binary.LittleEndian.Uint32(data[24:28])
-	
-	return nil
-}
-
-// ResponseMessage represents a response message for RPC.
-type ResponseMessage struct {
-	// Header is the protocol header.
-	Header ProtocolHeader
-	
-	// Tag is the unique request tag being responded to.
-	Tag uint64
-	
-	// SourceNodeID is the node ID sending the response.
-	SourceNodeID uint64
-	
-	// RequestID is the request identifier this response is for.
-	RequestID uint32
-	
-	// Status is the response status (0 = OK, non-zero = error).
-	Status uint8
-	
-	// Reserved bytes.
-	Reserved [3]byte
-}
-
-// ResponseMessageSize is the total size of a response message.
-const ResponseMessageSize = ProtocolHeaderSize + 8 + 8 + 4 + 1 + 3 // 28 bytes
-
-// MarshalBinary encodes a response message.
-func (r *ResponseMessage) MarshalBinary() []byte {
-	buf := make([]byte, ResponseMessageSize)
-	
-	// Protocol header
-	buf[0] = byte(ProtocolMessageResponse)
-	
-	// Tag (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[4:12], r.Tag)
-	
-	// SourceNodeID (8 bytes, little-endian)
-	binary.LittleEndian.PutUint64(buf[12:20], r.SourceNodeID)
-	
-	// RequestID (4 bytes, little-endian)
-	binary.LittleEndian.PutUint32(buf[20:24], r.RequestID)
-	
-	// Status (1 byte)
-	buf[24] = r.Status
-	
-	// Reserved (3 bytes)
-	copy(buf[25:28], r.Reserved[:])
-	
-	return buf
-}
-
-// UnmarshalBinary decodes a response message.
-func (r *ResponseMessage) UnmarshalBinary(data []byte) error {
-	if len(data) < ResponseMessageSize {
-		return ErrArgument
-	}
-	
-	// Protocol header
-	r.Header.MessageType = data[0]
-	
-	// Tag
-	r.Tag = binary.LittleEndian.Uint64(data[4:12])
-	
-	// SourceNodeID
-	r.SourceNodeID = binary.LittleEndian.Uint64(data[12:20])
-	
-	// RequestID
-	r.RequestID = binary.LittleEndian.Uint32(data[20:24])
-	
-	// Status
-	r.Status = data[24]
-	
-	// Reserved
-	copy(r.Reserved[:], data[25:28])
-	
-	return nil
-}
-
-// ParseProtocolMessage parses a protocol message from a byte slice.
-// Returns the specific message type and the parsed message.
-func ParseProtocolMessage(data []byte) (interface{}, error) {
-	if len(data) < ProtocolHeaderSize {
-		return nil, ErrArgument
-	}
-	
-	msgType := ProtocolMessageType(data[0])
-	
-	switch msgType {
-	case ProtocolMessageGossip:
-		gossip := &GossipMessage{}
-		err := gossip.UnmarshalBinary(data)
-		return gossip, err
-		
-	case ProtocolMessageACK:
-		ack := &ACKMessage{}
-		err := ack.UnmarshalBinary(data)
-		return ack, err
-		
-	case ProtocolMessageNACK:
-		nack := &NACKMessage{}
-		err := nack.UnmarshalBinary(data)
-		return nack, err
-		
-	case ProtocolMessageRequest:
-		request := &RequestMessage{}
-		err := request.UnmarshalBinary(data)
-		return request, err
-		
-	case ProtocolMessageResponse:
-		response := &ResponseMessage{}
-		err := response.UnmarshalBinary(data)
-		return response, err
-		
+	p := ParsedResponseHeader{Type: HeaderType(data[0])}
+	switch p.Type {
+	case HeaderTypeRspRel:
+		p.Reliable = true
+	case HeaderTypeRspAck:
+	case HeaderTypeRspNack:
+	case HeaderTypeRspBE:
 	default:
-		return nil, ErrArgument
+		return ParsedResponseHeader{}, ErrArgument
 	}
-}
-
-// IsProtocolMessage checks if a message starts with a protocol header.
-func IsProtocolMessage(data []byte) bool {
-	if len(data) < ProtocolHeaderSize {
-		return false
-	}
-	
-	msgType := ProtocolMessageType(data[0])
-	return msgType >= ProtocolMessageGossip && msgType <= ProtocolMessageResponse
+	p.Tag = data[1]
+	// seqno is u48 LE at [2:8].
+	p.Seqno = uint64(data[2]) | uint64(data[3])<<8 | uint64(data[4])<<16 |
+		uint64(data[5])<<24 | uint64(data[6])<<32 | uint64(data[7])<<40
+	p.Hash = binary.LittleEndian.Uint64(data[8:16])
+	p.MessageTag = binary.LittleEndian.Uint64(data[16:24])
+	return p, nil
 }

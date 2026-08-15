@@ -157,7 +157,7 @@ func (g *Gossip) SendGossip(cy *Cy, topic *Topic) error {
 	g.gossipCounter++
 	g.lastGossipTime = cy.Now()
 
-	// Create gossip data
+	// Create gossip data (CRDT state, post-header payload).
 	data := topic.GossipData()
 	if len(data) == 0 {
 		return ErrArgument
@@ -172,9 +172,20 @@ func (g *Gossip) SendGossip(cy *Cy, topic *Topic) error {
 		return err
 	}
 
+	// Prepend the 24-byte Cy session header (C header_gossip).
+	// Layout: [0]=type, [1]=0, [2]=incompat(0), [3]=lage,
+	// [4:8]=evictions(0), [8:16]=hash, [16:24]=evictions(u32 LE), [23]=namelen(0).
+	header := &Header{
+		Type:      HeaderTypeGossip,
+		Lage:      int8(topic.LogAge()),
+		Hash:      topic.Hash(),
+		Evictions: uint32(topic.Evictions()),
+	}
+	headed := PrependHeader(header, data)
+
 	// Send the gossip message
 	deadline := cy.Now() + Microsecond(g.period)
-	return cy.platform.SubjectWriterSend(writer, deadline, PriorityLow, data)
+	return cy.platform.SubjectWriterSend(writer, deadline, PriorityLow, headed)
 }
 
 // getShardID computes the shard ID for a topic hash.
@@ -223,27 +234,26 @@ func (g *Gossip) ReleaseWriter(subjectID uint32) {
 	}
 }
 
-// ProcessGossip processes an incoming gossip message.
+// ProcessGossip processes an incoming gossip message payload (header already
+// stripped by HandleMessage). Format: [hash:8][logAge:4][evictions:4] LE.
 func (g *Gossip) ProcessGossip(data []byte, subjectID uint32) {
-	// Parse the gossip data
-	// Format: [hash:8][logAge:4][evictions:4]
 	if len(data) < 16 {
 		return
 	}
 
 	var hash uint64
 	for i := 0; i < 8; i++ {
-		hash = (hash << 8) | uint64(data[i])
+		hash |= uint64(data[i]) << (i * 8)
 	}
 
 	var logAge int32
 	for i := 0; i < 4; i++ {
-		logAge = (logAge << 8) | int32(uint32(data[8+i]))
+		logAge |= int32(data[8+i]) << (i * 8)
 	}
 
 	var evictions uint32
 	for i := 0; i < 4; i++ {
-		evictions = (evictions << 8) | uint32(data[12+i])
+		evictions |= uint32(data[12+i]) << (i * 8)
 	}
 
 	// Update CRDT state

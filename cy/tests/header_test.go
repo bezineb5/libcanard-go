@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/opencyphal/cy-go"
@@ -8,87 +9,64 @@ import (
 
 // TestHeaderMarshalUnmarshal tests basic header serialization.
 func TestHeaderMarshalUnmarshal(t *testing.T) {
-	// Create a header
-	// Note: Priority and SourceNodeID are not part of the serialized header
-	// They are part of the transport layer (CAN ID, UDP header)
-	header := cy.NewHeader(
-		0x0123456789ABCDEF, // Tag
-		0xFEDCBA9876543210, // SequenceNumber
-		cy.Microsecond(1234567890), // Timestamp
-		0, // Priority (not serialized)
-		0, // SourceNodeID (not serialized)
-	)
-	
-	// Marshal to binary
+	header := cy.NewHeader(cy.HeaderTypeMsgBE, 42, 7, 0x0123456789ABCDEF, 0xFEDCBA9876543210)
+
 	data := header.MarshalBinary()
-	
-	// Verify size
+
 	if len(data) != cy.HeaderSize {
 		t.Errorf("Expected header size %d, got %d", cy.HeaderSize, len(data))
 	}
-	
-	// Unmarshal
+
 	decoded := &cy.Header{}
-	err := decoded.UnmarshalBinary(data)
-	if err != nil {
+	if err := decoded.UnmarshalBinary(data); err != nil {
 		t.Fatalf("Failed to unmarshal header: %v", err)
 	}
-	
-	// Verify fields
+
+	if decoded.Type != header.Type {
+		t.Errorf("Type mismatch: expected %d, got %d", header.Type, decoded.Type)
+	}
+	if decoded.Lage != header.Lage {
+		t.Errorf("Lage mismatch: expected %d, got %d", header.Lage, decoded.Lage)
+	}
+	if decoded.Evictions != header.Evictions {
+		t.Errorf("Evictions mismatch: expected %d, got %d", header.Evictions, decoded.Evictions)
+	}
+	if decoded.Hash != header.Hash {
+		t.Errorf("Hash mismatch: expected %016x, got %016x", header.Hash, decoded.Hash)
+	}
 	if decoded.Tag != header.Tag {
 		t.Errorf("Tag mismatch: expected %016x, got %016x", header.Tag, decoded.Tag)
 	}
-	if decoded.SequenceNumber != header.SequenceNumber {
-		t.Errorf("SequenceNumber mismatch: expected %016x, got %016x", 
-			header.SequenceNumber, decoded.SequenceNumber)
-	}
-	if decoded.Timestamp != header.Timestamp {
-		t.Errorf("Timestamp mismatch: expected %d, got %d", 
-			header.Timestamp, decoded.Timestamp)
-	}
-	// Note: Priority and SourceNodeID are not serialized, so we don't check them
 }
 
 // TestHeaderPrependAndParse tests prepending and parsing headers.
 func TestHeaderPrependAndParse(t *testing.T) {
-	// Create a header
-	header := cy.NewHeader(
-		0x1111111111111111,
-		0x2222222222222222,
-		cy.Microsecond(999999999),
-		cy.PriorityFast,
-		0x33333333,
-	)
-	
-	// Create payload
+	header := cy.NewHeader(cy.HeaderTypeMsgRel, -3, 99, 0x1111111111111111, 0x2222222222222222)
+
 	payload := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-	
-	// Prepend header
+
 	data := cy.PrependHeader(header, payload)
-	
-	// Verify total size
+
 	expectedSize := cy.HeaderSize + len(payload)
 	if len(data) != expectedSize {
 		t.Errorf("Expected size %d, got %d", expectedSize, len(data))
 	}
-	
-	// Parse header
+
 	parsedHeader, parsedPayload, err := cy.ParseHeader(data)
 	if err != nil {
 		t.Fatalf("Failed to parse header: %v", err)
 	}
-	
-	// Verify header
+
 	if parsedHeader.Tag != header.Tag {
 		t.Errorf("Tag mismatch after parse")
 	}
-	
-	// Verify payload
-	if len(parsedPayload) != len(payload) {
-		t.Errorf("Payload size mismatch: expected %d, got %d", 
-			len(payload), len(parsedPayload))
+	if parsedHeader.Hash != header.Hash {
+		t.Errorf("Hash mismatch after parse")
 	}
-	
+
+	if len(parsedPayload) != len(payload) {
+		t.Errorf("Payload size mismatch: expected %d, got %d", len(payload), len(parsedPayload))
+	}
 	for i := range payload {
 		if parsedPayload[i] != payload[i] {
 			t.Errorf("Payload mismatch at index %d", i)
@@ -106,7 +84,7 @@ func TestHeaderParseInvalid(t *testing.T) {
 		{"too_short", []byte{0x01, 0x02, 0x03}},
 		{"exact_size_minus_one", make([]byte, cy.HeaderSize-1)},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, _, err := cy.ParseHeader(tt.data)
@@ -120,282 +98,94 @@ func TestHeaderParseInvalid(t *testing.T) {
 // TestHeaderZeroValues tests header with zero values.
 func TestHeaderZeroValues(t *testing.T) {
 	header := &cy.Header{}
-	
-	// Marshal
+
 	data := header.MarshalBinary()
-	
-	// Unmarshal
+
 	decoded := &cy.Header{}
-	err := decoded.UnmarshalBinary(data)
-	if err != nil {
+	if err := decoded.UnmarshalBinary(data); err != nil {
 		t.Fatalf("Failed to unmarshal zero header: %v", err)
 	}
-	
-	// All fields should be zero
-	if decoded.Tag != 0 {
-		t.Errorf("Expected Tag 0, got %d", decoded.Tag)
-	}
-	if decoded.SequenceNumber != 0 {
-		t.Errorf("Expected SequenceNumber 0, got %d", decoded.SequenceNumber)
-	}
-	if decoded.Timestamp != 0 {
-		t.Errorf("Expected Timestamp 0, got %d", decoded.Timestamp)
-	}
-	if decoded.Priority != 0 {
-		t.Errorf("Expected Priority 0, got %d", decoded.Priority)
+
+	if decoded.Type != 0 || decoded.Lage != 0 || decoded.Evictions != 0 ||
+		decoded.Hash != 0 || decoded.Tag != 0 {
+		t.Errorf("Expected all zero fields, got %+v", decoded)
 	}
 }
 
-// TestProtocolHeader tests protocol message headers.
-func TestProtocolHeader(t *testing.T) {
-	// Test each protocol message type
-	for msgType := cy.ProtocolMessageGossip; msgType <= cy.ProtocolMessageResponse; msgType++ {
-		header := cy.ProtocolHeader{
-			MessageType: uint8(msgType),
-		}
-		
-		// Marshal
-		data := header.MarshalBinary()
-		
-		// Verify size
-		if len(data) != cy.ProtocolHeaderSize {
-			t.Errorf("Protocol header size mismatch for type %d", msgType)
-		}
-		
-		// First byte should be message type
-		if data[0] != byte(msgType) {
-			t.Errorf("Message type mismatch: expected %d, got %d", msgType, data[0])
-		}
-		
-		// Unmarshal
-		decoded := &cy.ProtocolHeader{}
-		err := decoded.UnmarshalBinary(data)
-		if err != nil {
-			t.Fatalf("Failed to unmarshal protocol header: %v", err)
-		}
-		
-		if decoded.MessageType != uint8(msgType) {
-			t.Errorf("Decoded message type mismatch")
-		}
+// TestACKHeader verifies the ACK/NACK header wire layout matches C:
+// type at [0], topic hash at [8:16], message tag at [16:24].
+func TestACKHeader(t *testing.T) {
+	h := cy.NewACKHeader(true, 0xDEADBEEF, 0x1234)
+	if h.Type != cy.HeaderTypeMsgAck {
+		t.Fatalf("expected MsgAck, got %d", h.Type)
+	}
+	buf := h.MarshalBinary()
+	if buf[0] != byte(cy.HeaderTypeMsgAck) {
+		t.Errorf("type byte mismatch")
+	}
+	if got := uint64(buf[8]) | uint64(buf[9])<<8 | uint64(buf[10])<<16 | uint64(buf[11])<<24 |
+		uint64(buf[12])<<32 | uint64(buf[13])<<40 | uint64(buf[14])<<48 | uint64(buf[15])<<56; got != 0xDEADBEEF {
+		t.Errorf("hash mismatch: %016x", got)
+	}
+	if got := uint64(buf[16]) | uint64(buf[17])<<8 | uint64(buf[18])<<16 | uint64(buf[19])<<24 |
+		uint64(buf[20])<<32 | uint64(buf[21])<<40 | uint64(buf[22])<<48 | uint64(buf[23])<<56; got != 0x1234 {
+		t.Errorf("tag mismatch: %016x", got)
+	}
+
+	nack := cy.NewACKHeader(false, 1, 2)
+	if nack.Type != cy.HeaderTypeMsgNack {
+		t.Errorf("expected MsgNack, got %d", nack.Type)
 	}
 }
 
-// TestGossipMessage tests gossip message serialization.
-func TestGossipMessage(t *testing.T) {
-	gossip := &cy.GossipMessage{
-		Header: cy.ProtocolHeader{
-			MessageType: uint8(cy.ProtocolMessageGossip),
-		},
-		Hash:       0x123456789ABCDEF0,
-		LogAge:     42,
-		Evictions:  7,
+// TestRSPHeader verifies the response header wire layout matches C do_respond exactly:
+// [0]=type, [1]=tag, [2:8]=seqno(u48 LE), [8:16]=hash, [16:24]=message_tag.
+func TestRSPHeader(t *testing.T) {
+	buf := cy.MarshalRSPHeader(true, 0xAB, 0x112233445566, 0xCAFE, 0x7788)
+	if len(buf) != cy.HeaderSize {
+		t.Fatalf("expected %d bytes, got %d", cy.HeaderSize, len(buf))
 	}
-	
-	// Marshal
-	data := gossip.MarshalBinary()
-	
-	// Verify size
-	if len(data) != cy.GossipMessageSize {
-		t.Errorf("Expected gossip message size %d, got %d", 
-			cy.GossipMessageSize, len(data))
+	if buf[0] != byte(cy.HeaderTypeRspRel) {
+		t.Errorf("type byte mismatch: %d", buf[0])
 	}
-	
-	// Unmarshal
-	decoded := &cy.GossipMessage{}
-	err := decoded.UnmarshalBinary(data)
+	if buf[1] != 0xAB {
+		t.Errorf("tag byte mismatch: %x", buf[1])
+	}
+	// seqno u48 LE at [2:8].
+	gotSeq := uint64(buf[2]) | uint64(buf[3])<<8 | uint64(buf[4])<<16 |
+		uint64(buf[5])<<24 | uint64(buf[6])<<32 | uint64(buf[7])<<40
+	if gotSeq != 0x112233445566 {
+		t.Errorf("seqno mismatch: %016x", gotSeq)
+	}
+	if got := binary.LittleEndian.Uint64(buf[8:16]); got != 0xCAFE {
+		t.Errorf("hash mismatch: %016x", got)
+	}
+	if got := binary.LittleEndian.Uint64(buf[16:24]); got != 0x7788 {
+		t.Errorf("message_tag mismatch: %016x", got)
+	}
+
+	ack := cy.MarshalRSPACKHeader(false, 0x01, 5, 0xBABE, 0x99)
+	if ack[0] != byte(cy.HeaderTypeRspNack) {
+		t.Errorf("ack type mismatch: %d", ack[0])
+	}
+	if ack[1] != 0x01 {
+		t.Errorf("ack tag mismatch")
+	}
+	gotAckSeq := uint64(ack[2]) | uint64(ack[3])<<8 | uint64(ack[4])<<16 |
+		uint64(ack[5])<<24 | uint64(ack[6])<<32 | uint64(ack[7])<<40
+	if gotAckSeq != 5 {
+		t.Errorf("ack seqno mismatch: %d", gotAckSeq)
+	}
+
+	// Round-trip parse.
+	dec, err := cy.ParseResponseHeader(buf)
 	if err != nil {
-		t.Fatalf("Failed to unmarshal gossip message: %v", err)
+		t.Fatal(err)
 	}
-	
-	// Verify fields
-	if decoded.Header.MessageType != uint8(cy.ProtocolMessageGossip) {
-		t.Error("MessageType mismatch")
+	if dec.Type != cy.HeaderTypeRspRel || !dec.Reliable {
+		t.Errorf("parsed type/reliable mismatch")
 	}
-	if decoded.Hash != gossip.Hash {
-		t.Errorf("Hash mismatch: expected %016x, got %016x", gossip.Hash, decoded.Hash)
-	}
-	if decoded.LogAge != gossip.LogAge {
-		t.Errorf("LogAge mismatch: expected %d, got %d", gossip.LogAge, decoded.LogAge)
-	}
-	if decoded.Evictions != gossip.Evictions {
-		t.Errorf("Evictions mismatch: expected %d, got %d", 
-			gossip.Evictions, decoded.Evictions)
-	}
-}
-
-// TestACKMessage tests ACK message serialization.
-func TestACKMessage(t *testing.T) {
-	ack := &cy.ACKMessage{
-		Header: cy.ProtocolHeader{
-			MessageType: uint8(cy.ProtocolMessageACK),
-		},
-		Tag:          0xDEADBEEFCAFEBABE,
-		SourceNodeID: 0x12345678,
-	}
-	
-	// Marshal
-	data := ack.MarshalBinary()
-	
-	// Verify size
-	if len(data) != cy.ACKMessageSize {
-		t.Errorf("Expected ACK message size %d, got %d", 
-			cy.ACKMessageSize, len(data))
-	}
-	
-	// Unmarshal
-	decoded := &cy.ACKMessage{}
-	err := decoded.UnmarshalBinary(data)
-	if err != nil {
-		t.Fatalf("Failed to unmarshal ACK message: %v", err)
-	}
-	
-	// Verify fields
-	if decoded.Header.MessageType != uint8(cy.ProtocolMessageACK) {
-		t.Error("MessageType mismatch")
-	}
-	if decoded.Tag != ack.Tag {
-		t.Errorf("Tag mismatch: expected %016x, got %016x", ack.Tag, decoded.Tag)
-	}
-	if decoded.SourceNodeID != ack.SourceNodeID {
-		t.Errorf("SourceNodeID mismatch: expected %016x, got %016x", 
-			ack.SourceNodeID, decoded.SourceNodeID)
-	}
-}
-
-// TestNACKMessage tests NACK message serialization.
-func TestNACKMessage(t *testing.T) {
-	// NACKMessage.ErrorCode is an int, not an error
-	nack := &cy.NACKMessage{
-		Header: cy.ProtocolHeader{
-			MessageType: uint8(cy.ProtocolMessageNACK),
-		},
-		Tag:          0xFEEDBEEF,
-		SourceNodeID: 0x87654321,
-		ErrorCode:    1, // Use int value instead of error
-	}
-	
-	// Marshal
-	data := nack.MarshalBinary()
-	
-	// Verify size
-	if len(data) != cy.NACKMessageSize {
-		t.Errorf("Expected NACK message size %d, got %d", 
-			cy.NACKMessageSize, len(data))
-	}
-	
-	// Unmarshal
-	decoded := &cy.NACKMessage{}
-	err := decoded.UnmarshalBinary(data)
-	if err != nil {
-		t.Fatalf("Failed to unmarshal NACK message: %v", err)
-	}
-	
-	// Verify fields
-	if decoded.Header.MessageType != uint8(cy.ProtocolMessageNACK) {
-		t.Error("MessageType mismatch")
-	}
-	if decoded.Tag != nack.Tag {
-		t.Errorf("Tag mismatch")
-	}
-	if decoded.SourceNodeID != nack.SourceNodeID {
-		t.Errorf("SourceNodeID mismatch")
-	}
-	if decoded.ErrorCode != nack.ErrorCode {
-		t.Errorf("ErrorCode mismatch")
-	}
-}
-
-// TestParseProtocolMessage tests the ParseProtocolMessage function.
-func TestParseProtocolMessage(t *testing.T) {
-	tests := []struct {
-		name    string
-		data    []byte
-		wantErr bool
-	}{
-		{
-			name:    "gossip",
-			data:    []byte{byte(cy.ProtocolMessageGossip), 0, 0, 0, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-			wantErr: false,
-		},
-		{
-			name:    "ack",
-			data:    []byte{byte(cy.ProtocolMessageACK), 0, 0, 0, 0xEF, 0xBE, 0xEE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-			wantErr: false,
-		},
-		{
-			name:    "invalid_type",
-			data:    []byte{0x99, 0, 0, 0}, // Invalid message type
-			wantErr: true,
-		},
-		{
-			name:    "too_short",
-			data:    []byte{byte(cy.ProtocolMessageGossip)},
-			wantErr: true,
-		},
-	}
-	
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			msg, err := cy.ParseProtocolMessage(tt.data)
-			
-			if tt.wantErr {
-				if err == nil {
-					t.Error("Expected error, got nil")
-				}
-				return
-			}
-			
-			if err != nil {
-				t.Errorf("Unexpected error: %v", err)
-				return
-			}
-			
-			if msg == nil {
-				t.Error("Expected message, got nil")
-				return
-			}
-			
-			// Type assertion based on first byte of data
-			msgType := tt.data[0]
-			if msgType == byte(cy.ProtocolMessageGossip) {
-				_, ok := msg.(*cy.GossipMessage)
-				if !ok {
-					t.Error("Expected *GossipMessage")
-				}
-			} else if msgType == byte(cy.ProtocolMessageACK) {
-				_, ok := msg.(*cy.ACKMessage)
-				if !ok {
-					t.Error("Expected *ACKMessage")
-				}
-			}
-		})
-	}
-}
-
-// TestIsProtocolMessage tests the IsProtocolMessage function.
-func TestIsProtocolMessage(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     []byte
-		expected bool
-	}{
-		{"empty", []byte{}, false},
-		{"too_short", []byte{0x00}, false},
-		{"gossip", []byte{byte(cy.ProtocolMessageGossip), 0, 0, 0}, true},
-		{"ack", []byte{byte(cy.ProtocolMessageACK), 0, 0, 0}, true},
-		{"nack", []byte{byte(cy.ProtocolMessageNACK), 0, 0, 0}, true},
-		{"request", []byte{byte(cy.ProtocolMessageRequest), 0, 0, 0}, true},
-		{"response", []byte{byte(cy.ProtocolMessageResponse), 0, 0, 0}, true},
-		{"invalid_type", []byte{0x99, 0, 0, 0}, false},
-		{"application_data", []byte{0x10, 0x01, 0x02, 0x03}, false},
-	}
-	
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := cy.IsProtocolMessage(tt.data)
-			if result != tt.expected {
-				t.Errorf("Expected %v, got %v", tt.expected, result)
-			}
-		})
+	if dec.Tag != 0xAB || dec.Seqno != 0x112233445566 || dec.Hash != 0xCAFE || dec.MessageTag != 0x7788 {
+		t.Errorf("parsed fields mismatch: %+v", dec)
 	}
 }
