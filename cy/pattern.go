@@ -37,6 +37,11 @@ func (pm *PatternMatcher) AddPattern(pattern string, sub *Subscriber) {
 	pm.patterns[pattern] = append(pm.patterns[pattern], sub)
 }
 
+// HasPattern reports whether at least one subscriber is registered for the pattern.
+func (pm *PatternMatcher) HasPattern(pattern string) bool {
+	return len(pm.patterns[pattern]) > 0
+}
+
 // RemovePattern removes a pattern subscription.
 func (pm *PatternMatcher) RemovePattern(pattern string, sub *Subscriber) {
 	if subs, ok := pm.patterns[pattern]; ok {

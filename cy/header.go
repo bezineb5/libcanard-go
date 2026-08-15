@@ -193,6 +193,36 @@ func MarshalGossipMessage(lage int8, hash, evictions uint64, name string) []byte
 	return h
 }
 
+// MarshalScout builds a scout frame: a 24-byte header with type HeaderTypeScout
+// and the pattern name length in byte 23, followed by the pattern name bytes.
+// Scouts are always broadcast and simply ask receivers to unicast gossips for any
+// local topics matching the carried pattern (C do_send_scout).
+func MarshalScout(pattern string) []byte {
+	buf := make([]byte, HeaderSize)
+	buf[0] = byte(HeaderTypeScout)
+	// [1:23] are reserved/zero: incompatibility [4:8] and hash [8:16] must be zero.
+	if len(pattern) > 0 {
+		if len(pattern) > 255 {
+			pattern = pattern[:255]
+		}
+		buf[23] = byte(len(pattern))
+		buf = append(buf, []byte(pattern)...)
+	}
+	return buf
+}
+
+// ParseScout decodes a scout frame, returning the carried pattern name.
+func ParseScout(data []byte) (pattern string, ok bool) {
+	if len(data) < HeaderSize {
+		return "", false
+	}
+	nameLen := int(data[23])
+	if nameLen == 0 || nameLen > len(data)-HeaderSize {
+		return "", false
+	}
+	return string(data[HeaderSize : HeaderSize+nameLen]), true
+}
+
 // ParsedGossip is the decoded form of a gossip message.
 type ParsedGossip struct {
 	Lage      int8

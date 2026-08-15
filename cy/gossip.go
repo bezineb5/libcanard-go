@@ -251,6 +251,23 @@ func (g *Gossip) SendGossip(cy *Cy, topic *Topic, urgent bool) error {
 	return cy.platform.SubjectWriterSend(writer, deadline, PriorityLow, data)
 }
 
+// sendGossipUnicast sends a single gossip for a topic directly to a remote node
+// via unicast transport (the scout response path, C send_gossip_unicast). The
+// gossip carries the topic name so the remote can auto-subscribe. It takes no
+// locks (the caller holds c.mu) and performs a single lock-free platform send.
+func (g *Gossip) sendGossipUnicast(cy *Cy, topic *Topic, lane Lane) error {
+	now := cy.Now()
+	// Build the C-compatible wire form: 24-byte header + name.
+	data := MarshalGossipMessage(int8(topic.Lage(now)), topic.Hash(), uint64(topic.Evictions()), topic.GossipName())
+	deadline := now + Microsecond(g.period)
+	// C uses the lane priority if available, otherwise nominal.
+	prio := lane.Priority
+	if prio == 0 {
+		prio = PriorityNominal
+	}
+	return cy.platform.Unicast(lane, deadline, data)
+}
+
 // ProcessGossip handles a received gossip message. The 24-byte header has already
 // been read and stripped by HandleMessage; lage/hash/evictions come from that
 // header and name is the remaining payload (the topic name, if any). It mirrors

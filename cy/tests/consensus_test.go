@@ -147,6 +147,94 @@ func TestInlineGossipKnownTopic(t *testing.T) {
 	}
 }
 
+// TestScoutTriggersUnicastGossipAutoSubscribe verifies the full scout loop: a
+// node with a pattern subscription scouts the network; a peer holding a matching
+// topic responds with a unicast gossip; the scouting node auto-subscribes the
+// topic. This exercises both scout emission (on pattern subscribe) and scout
+// response handling (on_scout -> unicast gossip -> auto-subscribe).
+func TestScoutTriggersUnicastGossipAutoSubscribe(t *testing.T) {
+	platformA := NewMockPlatform()
+	nodeA, err := cy.New(platformA, "nodeA", "", "")
+	if err != nil {
+		t.Fatalf("New nodeA failed: %v", err)
+	}
+	defer nodeA.Destroy()
+
+	platformB := NewMockPlatform()
+	nodeB, err := cy.New(platformB, "nodeB", "", "")
+	if err != nil {
+		t.Fatalf("New nodeB failed: %v", err)
+	}
+	defer nodeB.Destroy()
+
+	// Node A advertises a topic matching the pattern.
+	if _, err := nodeA.Advertise("sensors/temp"); err != nil {
+		t.Fatalf("Advertise failed: %v", err)
+	}
+
+	// Node B subscribes to a pattern; this must emit a scout (broadcast). The
+	// scout is attempted synchronously and, on success, removed from the pending
+	// set.
+	if _, err := nodeB.Subscribe("sensors/>", 256); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+	for _, p := range nodeB.PendingScouts() {
+		if p == "sensors/>" {
+			t.Errorf("pattern scout for %q was not emitted", p)
+		}
+	}
+
+	// A concrete (non-pattern) subscription must NOT trigger scouting.
+	if _, err := nodeB.Subscribe("sensors/pressure", 256); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+	if len(nodeB.PendingScouts()) != 0 {
+		t.Errorf("concrete subscription should not leave pending scouts: %v", nodeB.PendingScouts())
+	}
+
+	// Deliver a scout from B to A (addressed to A's broadcast subject). A should
+	// respond by unicasting a gossip for the matching local topic "sensors/temp".
+	scout := cy.MarshalScout("sensors/>")
+	scoutMsg := cy.NewMessage(scout)
+	broadcastA := nodeA.BroadcastSubjectID()
+	nodeA.HandleMessage(cy.Lane{ID: 2}, &broadcastA, *cy.NewMessageTS(0, scoutMsg))
+
+	// Find A's unicast gossip response for "sensors/temp".
+	var response []byte
+	for _, rm := range platformA.ReceivedMessages {
+		if parsed, perr := cy.ParseGossipMessage(rm.Data); perr == nil && parsed.Name == "sensors/temp" {
+			response = rm.Data
+		}
+	}
+	if response == nil {
+		t.Fatal("expected nodeA to unicast a gossip for sensors/temp in response to the scout")
+	}
+
+	// Deliver that unicast gossip to B (unicast path, subjectID == nil). B should
+	// auto-subscribe the topic.
+	respMsg := cy.NewMessage(response)
+	nodeB.HandleMessage(cy.Lane{ID: 1}, nil, *cy.NewMessageTS(0, respMsg))
+
+	if got := nodeB.FindTopic("sensors/temp"); got == nil {
+		t.Fatal("expected nodeB to auto-subscribe sensors/temp from unicast gossip")
+	}
+}
+
+// TestScoutWireRoundTrip verifies the scout wire format is self-consistent.
+func TestScoutWireRoundTrip(t *testing.T) {
+	pattern := "a/b/>"
+	data := cy.MarshalScout(pattern)
+	if got, ok := cy.ParseScout(data); !ok || got != pattern {
+		t.Errorf("ParseScout = (%q, %v), want (%q, true)", got, ok, pattern)
+	}
+	if data[0] != byte(cy.HeaderTypeScout) {
+		t.Errorf("scout header type byte = %d, want %d", data[0], cy.HeaderTypeScout)
+	}
+	if data[23] != byte(len(pattern)) {
+		t.Errorf("scout name length byte = %d, want %d", data[23], len(pattern))
+	}
+}
+
 // itoa is a tiny local integer-to-string helper to avoid importing strconv for
 // test-only candidate names.
 func itoa(n int) string {

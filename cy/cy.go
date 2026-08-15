@@ -74,6 +74,11 @@ type Cy struct {
 	// observability; the rest are sharded. Urgent gossips are always broadcast.
 	gossipBroadcastRatio uint8
 
+	// scouting tracks pattern subscriptions that still need to emit a scout
+	// (broadcast request for matching gossips). Entries are removed once a scout
+	// is sent successfully; remaining entries are retried by sendPendingScouts().
+	scouting map[string]struct{}
+
 	// prngState is the PRNG state for random number generation.
 	prngState uint64
 
@@ -130,6 +135,7 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 	cy.rpc = newRPC(cy)
 	cy.crdt = NewCRDT(cy, SubjectIDModulus16bit)
 	cy.gossip = newGossip(cy)
+	cy.scouting = make(map[string]struct{})
 
 	// Set up the gossip/broadcast subject layout. The broadcast subject-ID and the
 	// gossip shard count are derived from the modulus; they must be created before
@@ -279,6 +285,9 @@ func (c *Cy) SpinUntil(deadline Microsecond) error {
 	c.olga.RunUntil(int64(deadline))
 	// olga.RunUntil doesn't return an error currently
 
+	// Retry any scouts that failed to emit when their pattern subscription was created.
+	c.sendPendingScouts()
+
 	// Process platform events
 	err := c.platform.Spin(deadline)
 	if err != nil {
@@ -377,9 +386,12 @@ func (c *Cy) handleMulticastMessage(lane Lane, subjectID uint32, message Message
 		c.gossip.ProcessGossip(lage, hash, uint64(evictions), message.Content.Payload(), subjectID, scope, now)
 
 	case HeaderTypeScout:
-		// TODO: implement scout handling (C on_scout): respond with unicast gossips
-		// for matching local topics. Currently a no-op.
-		_ = broadcast
+		// Scouts are always broadcast; they ask us to unicast gossips for any local
+		// topics matching the carried pattern. (C on_scout.)
+		pattern := string(message.Content.Payload())
+		if pattern != "" {
+			c.onScout(pattern, lane, now)
+		}
 
 	default:
 		// Unknown/unsupported multicast type.
@@ -423,8 +435,57 @@ func (c *Cy) handleUnicastMessage(lane Lane, message MessageTS) {
 		})
 	case HeaderTypeRspAck, HeaderTypeRspNack:
 		c.handleResponseAckMessage(lane, hdr, message)
+	case HeaderTypeGossip:
+		// A unicast gossip (e.g., a scout response) carries the topic name as the
+		// payload and is processed with gossip_unicast scope so unknown topics are
+		// auto-subscribed. (C on_gossip with unicast scope.)
+		age := int8(hdr[3])
+		hash := binary.LittleEndian.Uint64(hdr[8:16])
+		evictions := binary.LittleEndian.Uint32(hdr[16:20])
+		c.gossip.ProcessGossip(age, hash, uint64(evictions), message.Content.Payload(), 0, gossipUnicast, message.Timestamp)
 	default:
 		// Unicast carrying a non-unicast type is invalid; ignore.
+	}
+}
+
+// sendScout broadcasts a scout frame for the given pattern, asking every peer to
+// unicast gossips for any local topics matching the pattern. It mirrors C
+// do_send_scout(). On success the pattern is removed from the pending-scout set.
+// The caller must hold c.mu. It does not re-enter the lock (the platform send is
+// lock-free with respect to c.mu).
+func (c *Cy) sendScout(pattern string) error {
+	if c.broadWriter == nil {
+		return ErrArgument
+	}
+	now := c.Now()
+	deadline := now + MEGA
+	data := MarshalScout(pattern)
+	if err := c.platform.SubjectWriterSend(c.broadWriter, deadline, PriorityNominal, data); err != nil {
+		return err
+	}
+	delete(c.scouting, pattern)
+	return nil
+}
+
+// sendPendingScouts retries any scouts that previously failed to send. It is
+// invoked from Spin() so pattern subscriptions that could not emit a scout at
+// creation time eventually do. The caller must NOT hold c.mu.
+func (c *Cy) sendPendingScouts() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for pattern := range c.scouting {
+		_ = c.sendScout(pattern)
+	}
+}
+
+// onScout handles an incoming scout: for each local topic whose name matches the
+// scout's pattern, send a unicast gossip directly to the asking node so it can
+// auto-subscribe the topic. It mirrors C on_scout(). The caller must hold c.mu.
+func (c *Cy) onScout(pattern string, lane Lane, now Microsecond) {
+	for name, topic := range c.topicsByName {
+		if matched, _ := MatchPattern(pattern, name); matched {
+			_ = c.gossip.sendGossipUnicast(c, topic, lane)
+		}
 	}
 }
 
@@ -553,7 +614,16 @@ func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subsc
 		sub := NewPatternSubscriber(c, resolvedName, extent)
 
 		// Add to pattern matcher
+		firstForPattern := !c.patternMatcher.HasPattern(resolvedName)
 		c.patternMatcher.AddPattern(resolvedName, sub)
+
+		// A freshly created pattern subscription scouts the network for matching
+		// topics: we broadcast a scout and peers respond with unicast gossips
+		// (C sets needs_scouting and calls do_send_scout on root creation).
+		if firstForPattern {
+			c.scouting[resolvedName] = struct{}{}
+			c.sendScout(resolvedName)
+		}
 
 		return sub, nil
 	}
@@ -691,6 +761,18 @@ func (c *Cy) TopicsBySubjectID() map[uint32]*Topic {
 		snap[k] = v
 	}
 	return snap
+}
+
+// PendingScouts returns the set of pattern subscriptions that still need to emit
+// a scout (their broadcast scout has not yet been sent successfully).
+func (c *Cy) PendingScouts() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.scouting))
+	for p := range c.scouting {
+		out = append(out, p)
+	}
+	return out
 }
 
 // SetSubjectIDModulus sets the subject-ID modulus for the network.
