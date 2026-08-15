@@ -15,17 +15,17 @@ type Publisher struct {
 	priority Priority
 	// ackTimeout is the timeout for reliable message acknowledgments.
 	ackTimeout Microsecond
-	
+
 	// For reliable publishers
 	// reliable manages reliable delivery.
 	reliable *ReliableDelivery
-	
+
 	// For request/response
 	// nextRequestTag is the next tag to use for requests.
 	nextRequestTag uint64
 	// pendingRequests is a map of message tags to pending request futures.
 	pendingRequests map[uint64]*RequestFuture
-	
+
 	// For client publishers (expecting responses)
 	// responseExtent is the maximum size of response messages.
 	responseExtent int
@@ -33,10 +33,10 @@ type Publisher struct {
 	// Tag generation state (C: topic->pub_tag_baseline + topic->pub_seqno).
 	msgTagBaseline uint64
 	msgSeqno       uint64
-	
+
 	// mu protects the publisher state.
 	mu sync.RWMutex
-	
+
 	// destroyed indicates whether the publisher has been destroyed.
 	destroyed bool
 }
@@ -56,13 +56,13 @@ type Association struct {
 // NewPublisher creates a new publisher for the specified topic.
 func NewPublisher(cy *Cy, topic *Topic) *Publisher {
 	pub := &Publisher{
-		cy:             cy,
-		topic:          topic,
-		priority:       PriorityNominal,
-		ackTimeout:     ACKBaselineDefaultTimeout,
-		nextRequestTag: 0,
+		cy:              cy,
+		topic:           topic,
+		priority:        PriorityNominal,
+		ackTimeout:      ACKBaselineDefaultTimeout,
+		nextRequestTag:  0,
 		pendingRequests: make(map[uint64]*RequestFuture),
-		responseExtent: 0,
+		responseExtent:  0,
 		// C seeds the baseline from the platform/PRNG; we use a non-zero
 		// deterministic baseline derived from the topic hash so tags are
 		// unique across reboots as required by the protocol.
@@ -80,7 +80,25 @@ func NewPublisher(cy *Cy, topic *Topic) *Publisher {
 func NewClientPublisher(cy *Cy, topic *Topic, responseExtent int) *Publisher {
 	pub := NewPublisher(cy, topic)
 	pub.responseExtent = responseExtent
+	// C cy_advertise_client grows the node's incoming unicast extent so large
+	// reliable responses fit the reassembly buffer. Use the max across all
+	// client publishers so the largest requirement wins.
+	if needed := responseExtent + HeaderSize; needed > cy.UnicastExtent() {
+		cy.SetUnicastExtent(needed)
+	}
 	return pub
+}
+
+// mapSendError converts a transport-layer error (builtin error, frequently a
+// cy.Error boxed as error) into the cy.Error domain for future completion.
+func mapSendError(err error) Error {
+	if err == nil {
+		return OK
+	}
+	if e, ok := err.(Error); ok {
+		return e
+	}
+	return ErrMedia
 }
 
 // Topic returns the topic this publisher is publishing to.
@@ -132,31 +150,45 @@ func (p *Publisher) Destroy() {
 	p.reliable.Cancel()
 }
 
-// publishImpl is the single point that prepends the 24-byte Cy session header
-// and pushes the headed message to the transport. headerType selects the wire
-// message type (best-effort vs reliable). It mirrors C do_publish_impl.
-func (p *Publisher) publishImpl(deadline Microsecond, data []byte, headerType HeaderType) error {
+// buildWire prepends the 24-byte Cy session header and returns the headed
+// payload together with the wire tag (publisher sequence tag). It takes the
+// publisher lock so sequence numbering and tag stay consistent between the
+// cached wire bytes and the tag used for ACK correlation. headerType selects
+// the wire message type (best-effort vs reliable). Mirrors C do_publish_impl.
+func (p *Publisher) buildWire(data []byte, headerType HeaderType) (uint64, []byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.destroyed {
-		return ErrArgument
+		return 0, nil, ErrArgument
 	}
 	p.msgSeqno++
 	tag := p.msgTagBaseline + p.msgSeqno
 	header := NewHeader(headerType, int8(p.topic.LogAge()), uint32(p.topic.Evictions()), p.topic.Hash(), tag)
-	headed := PrependHeader(header, data)
+	wire := PrependHeader(header, data)
+	return tag, wire, nil
+}
+
+// sendWire transmits already-headed payload onto the multicast subject for this
+// publisher's topic. The header is reused verbatim on every retransmit so the
+// wire tag is stable for ACK correlation.
+func (p *Publisher) sendWire(deadline Microsecond, wire []byte) error {
 	writer, err := p.cy.platform.NewSubjectWriter(p.topic.subjectID)
 	if err != nil {
 		return err
 	}
 	defer p.cy.platform.DestroySubjectWriter(writer)
-	return p.cy.platform.SubjectWriterSend(writer, deadline, p.priority, headed)
+	return p.cy.platform.SubjectWriterSend(writer, deadline, p.priority, wire)
 }
 
 // Publish sends a best-effort (non-reliable) message.
 // The deadline is the absolute time by which the message must be sent.
 func (p *Publisher) Publish(deadline Microsecond, data []byte) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.publishImpl(deadline, data, HeaderTypeMsgBE)
+	_, wire, err := p.buildWire(data, HeaderTypeMsgBE)
+	if err != nil {
+		return err
+	}
+	return p.sendWire(deadline, wire)
 }
 
 // PublishReliable sends a reliable message.
@@ -164,11 +196,11 @@ func (p *Publisher) Publish(deadline Microsecond, data []byte) error {
 // Returns a future that will be completed when the message is delivered or the deadline is reached.
 func (p *Publisher) PublishReliable(deadline Microsecond, data []byte) *PublicationFuture {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	if p.destroyed {
+		p.mu.RUnlock()
 		return nil
 	}
+	p.mu.RUnlock()
 
 	return p.reliable.Publish(deadline, data)
 }

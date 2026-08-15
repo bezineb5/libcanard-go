@@ -81,26 +81,26 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 	}
 
 	cy := &Cy{
-		platform:            platform,
-		olga:                olga.New(),
-		home:                home,
-		ns:                  namespace,
-		remap:              make(map[string]string),
-		topicsByName:       make(map[string]*Topic),
-		topicsByHash:       make(map[uint64]*Topic),
-		topicsBySubjectID:  make(map[uint32]*Topic),
-		publishers:         make(map[*Topic]*Publisher),
-		subscribers:        make(map[*Topic][]*Subscriber),
-		unicastExtent:      0,
-		startedAt:          0,
+		platform:             platform,
+		olga:                 olga.New(),
+		home:                 home,
+		ns:                   namespace,
+		remap:                make(map[string]string),
+		topicsByName:         make(map[string]*Topic),
+		topicsByHash:         make(map[uint64]*Topic),
+		topicsBySubjectID:    make(map[uint32]*Topic),
+		publishers:           make(map[*Topic]*Publisher),
+		subscribers:          make(map[*Topic][]*Subscriber),
+		unicastExtent:        0,
+		startedAt:            0,
 		implicitTopicTimeout: ImplicitTopicDefaultTimeout,
 		ackBaselineTimeout:   ACKBaselineDefaultTimeout,
-		gossip:             nil, // Will be initialized below
-		rpc:                nil, // Will be initialized below
-		crdt:               nil, // Will be initialized below
-		patternMatcher:      NewPatternMatcher(),
-		subjectIDModulus:    SubjectIDModulus16bit,
-		prngState:           0,
+		gossip:               nil, // Will be initialized below
+		rpc:                  nil, // Will be initialized below
+		crdt:                 nil, // Will be initialized below
+		patternMatcher:       NewPatternMatcher(),
+		subjectIDModulus:     SubjectIDModulus16bit,
+		prngState:            0,
 	}
 
 	// Set up the platform
@@ -119,7 +119,7 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 	cy.rpc = newRPC(cy)
 	cy.crdt = NewCRDT(cy, SubjectIDModulus16bit)
 	cy.gossip = newGossip(cy)
-	
+
 	// Set up gossip shard count
 	cy.gossip.SetShardCount(1) // Default to 1 shard for now
 
@@ -315,18 +315,22 @@ func (c *Cy) handleUnicastMessage(lane Lane, message MessageTS) {
 	if message.Content == nil || message.Content.Size() < HeaderSize {
 		return
 	}
-	// Read the type byte from offset 0 and the tag from offset 16 before skipping.
+	// Read the type byte from offset 0, the topic hash from offset 8, and the tag
+	// from offset 16 before skipping. ACK/NACK headers carry the topic hash at
+	// [8:16] and the message tag at [16:24] (see header.go), which we use to
+	// route the ACK to the correct publisher.
 	var hdr [HeaderSize]byte
 	if message.Content.Read(0, HeaderSize, hdr[:]) != HeaderSize {
 		return
 	}
 	msgType := HeaderType(hdr[0])
+	topicHash := binary.LittleEndian.Uint64(hdr[8:16])
 	tag := binary.LittleEndian.Uint64(hdr[16:24])
 	message.Content.Skip(HeaderSize)
 
 	switch msgType {
 	case HeaderTypeMsgAck, HeaderTypeMsgNack:
-		c.handleACKMessage(lane, tag)
+		c.handleACKMessage(lane, topicHash, tag, msgType == HeaderTypeMsgAck)
 	case HeaderTypeRspBE, HeaderTypeRspRel:
 		parsed, err := ParseResponseHeader(hdr[:])
 		if err != nil {
@@ -359,14 +363,30 @@ func (c *Cy) handleResponseMessage(lane Lane, messageTag, seqno uint64, tag byte
 	}
 }
 
-// handleACKMessage handles an incoming message ACK/NACK (C header_msg_ack/nack).
-// The tag is the header's tag field; we ACK every publisher's tag (C collapses to
-// a single ack on the publishing node).
-func (c *Cy) handleACKMessage(lane Lane, tag uint64) {
-	c.mu.RLock()
-	_ = lane
-	c.mu.RUnlock()
-	_ = tag
+// handleACKMessage routes an incoming message ACK/NACK (C header_msg_ack/nack) to
+// the publisher responsible for the tagged topic. The topic hash carried in the
+// ACK header identifies the publisher (C collapses per-node ACKs, but routing by
+// topic keeps the Go model faithful to one-publisher-per-topic). Unknown topics
+// or tags are ignored (orphaned/duplicate ACKs), matching C's trace path.
+//
+// NOTE: HandleMessage already holds c.mu (write) for the duration of message
+// dispatch, so this function must NOT re-acquire c.mu (RWMutex is not
+// re-entrant for a write-locked goroutine).
+func (c *Cy) handleACKMessage(lane Lane, topicHash, tag uint64, positive bool) {
+	topic, ok := c.topicsByHash[topicHash]
+	if !ok {
+		return
+	}
+	pub := c.publishers[topic]
+	if pub == nil {
+		return
+	}
+
+	if positive {
+		pub.handleAck(lane.ID, tag)
+	} else {
+		pub.handleNack(lane.ID, tag)
+	}
 }
 
 // handleResponseAckMessage handles an incoming response ACK/NACK (C header_rsp_ack/nack).
@@ -399,7 +419,6 @@ func (c *Cy) handleResponseAckMessage(lane Lane, hdr [HeaderSize]byte, message M
 	}
 	fut.onAck(positive)
 }
-
 
 // handleRequestMessage is unused under the C wire model (requests arrive via the
 // subscriber path / unicast). Retained for API completeness.
@@ -445,10 +464,10 @@ func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 	if IsPattern(resolvedName) {
 		// Create a pattern subscriber
 		sub := NewPatternSubscriber(c, resolvedName, extent)
-		
+
 		// Add to pattern matcher
 		c.patternMatcher.AddPattern(resolvedName, sub)
-		
+
 		return sub, nil
 	}
 

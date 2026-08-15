@@ -2,13 +2,24 @@ package cy
 
 import (
 	"sync"
-	"time"
 )
 
 // ReliableDelivery manages reliable message delivery for publishers.
 // It tracks associations (remote subscribers) and handles ACK/NACK messages.
+//
+// Faithful port of the C reliable-publish contract:
+//   - A publication is acknowledged on the first ACK from ANY remote.
+//   - A publication completes with OK once it is acknowledged and every known
+//     subscriber association present at publish time has explicitly ACKed it.
+//   - A publisher with zero known associations completes with OK on the first
+//     ACK (e.g. a late subscriber that joined after publish).
+//   - NACKs are treated as gaps to be repaired by the retransmission cycle; they
+//     never complete or fail the future.
+//   - Retransmission uses a deadline-driven doubling backoff (ack_timeout *= 2),
+//     surfacing transient ErrLag, until the publish deadline elapses, after
+//     which completion materializes as OK (fully ACKed) or ErrDelivery.
 type ReliableDelivery struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 
 	// publisher is the parent publisher.
 	publisher *Publisher
@@ -19,32 +30,30 @@ type ReliableDelivery struct {
 	// pending maps message tags to pending reliable messages.
 	pending map[uint64]*reliableMessage
 
-	// nextTag is the next message tag to use.
-	nextTag uint64
-
-	// ackTimeout is the timeout for waiting for acknowledgments.
+	// ackTimeout is the current (doubling) retransmission timeout.
 	ackTimeout Microsecond
-
-	// retryCount tracks the number of retries for each message.
-	maxRetries int
 }
 
 // reliableMessage represents a message being sent reliably.
 type reliableMessage struct {
-	// tag is the unique message tag.
+	// tag is the wire message tag (== publisher sequence tag).
 	tag uint64
-	// data is the message payload.
-	data []byte
-	// deadline is when the message must be delivered by.
+	// wire is the fully headed payload, reused verbatim on every retransmit.
+	wire []byte
+	// deadline is the absolute time by which the message must be delivered.
 	deadline Microsecond
-	// future is the future for this message.
+	// ackTimeout is the current retransmission timeout for this message.
+	ackTimeout Microsecond
+	// future is the publication future for this message.
 	future *PublicationFuture
-	// sentAt tracks when the message was first sent.
+	// sentAt tracks when the message was last sent (for lag diagnostics).
 	sentAt Microsecond
-	// retryCount tracks how many times this message has been retried.
+	// retryCount tracks how many times this message has been retransmitted.
 	retryCount int
-	// ackedBy tracks which remotes have acknowledged.
-	ackedBy map[uint64]bool
+	// remaining is the set of known association remote-IDs still expected to ACK.
+	remaining map[uint64]bool
+	// acknowledged is set true on the first ACK from any remote.
+	acknowledged bool
 }
 
 // newReliableDelivery creates a new ReliableDelivery instance.
@@ -52,10 +61,8 @@ func newReliableDelivery(pub *Publisher) *ReliableDelivery {
 	return &ReliableDelivery{
 		publisher:    pub,
 		associations: make(map[uint64]*Association),
-		pending:     make(map[uint64]*reliableMessage),
-		nextTag:     0,
-		ackTimeout:  pub.ackTimeout,
-		maxRetries:  3,
+		pending:      make(map[uint64]*reliableMessage),
+		ackTimeout:   pub.ackTimeout,
 	}
 }
 
@@ -68,132 +75,192 @@ func (rd *ReliableDelivery) SetAckTimeout(timeout Microsecond) {
 
 // AckTimeout returns the acknowledgment timeout.
 func (rd *ReliableDelivery) AckTimeout() Microsecond {
-	rd.mu.RLock()
-	defer rd.mu.RUnlock()
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
 	return rd.ackTimeout
 }
 
-// Publish sends a reliable message.
+// Publish sends a reliable message. It returns a future that completes with OK
+// once the message is acknowledged by every known subscriber (or, with zero
+// known subscribers, by the first ACK), or ErrDelivery if the deadline elapses
+// before that happens.
 func (rd *ReliableDelivery) Publish(deadline Microsecond, data []byte) *PublicationFuture {
+	pub := rd.publisher
+
+	// Build the wire bytes (24-byte header + payload) and the wire tag under the
+	// publisher lock so sequence numbering and tag stay consistent. publishImpl
+	// internally takes pub.mu for the sequence number.
+	tag, wire, err := pub.buildWire(data, HeaderTypeMsgRel)
+	if err != nil {
+		return NewFailedPublicationFuture(mapSendError(err))
+	}
+
 	rd.mu.Lock()
-	defer rd.mu.Unlock()
 
-	// Generate a new tag
-	tag := rd.nextTag
-	rd.nextTag++
-
-	// Create the future
-	// Total count is the number of associations + 1 (for multicast)
-	totalCount := len(rd.associations) + 1
-	if totalCount == 0 {
-		totalCount = 1
+	// Snapshot the known associations at publish time. These are the remotes we
+	// wait on; an ACK from an unknown remote still confirms/completes the
+	// publication but is not counted in remaining.
+	remaining := make(map[uint64]bool, len(rd.associations))
+	for remoteID := range rd.associations {
+		remaining[remoteID] = true
 	}
 
-	future := NewPublicationFuture(tag, totalCount)
-
-	// Create the reliable message
+	future := NewPublicationFuture(tag, len(remaining))
 	rmsg := &reliableMessage{
-		tag:      tag,
-		data:     data,
-		deadline: deadline,
-		future:   future,
-		sentAt:   rd.publisher.cy.Now(),
-		ackedBy:  make(map[uint64]bool),
+		tag:          tag,
+		wire:         wire,
+		deadline:     deadline,
+		ackTimeout:   rd.ackTimeout,
+		future:       future,
+		sentAt:       pub.cy.Now(),
+		retryCount:   0,
+		remaining:    remaining,
+		acknowledged: false,
 	}
-
 	rd.pending[tag] = rmsg
 
-	// Send the initial message
-	rd.sendMessage(rmsg)
+	if err := rd.send(rmsg); err != nil {
+		delete(rd.pending, tag)
+		rd.mu.Unlock()
+		return NewFailedPublicationFuture(mapSendError(err))
+	}
 
-	// Schedule timeout
-	cy := rd.publisher.cy
+	cy := pub.cy
+	rd.armTimeout(rmsg)
+	rd.mu.Unlock()
+
+	// Schedule the final materialization at the publish deadline.
 	cy.olga.Schedule(int64(deadline), func() {
-		rd.handleTimeout(tag)
+		rd.materialize(rmsg.tag)
 	})
-
 	return future
 }
 
-// sendMessage sends a reliable message. The 24-byte Cy session header with
-// type=msg_rel is prepended by publishImpl (never double-prepended).
-func (rd *ReliableDelivery) sendMessage(rmsg *reliableMessage) {
-	pub := rd.publisher
-	// publishImpl prepends the header (type msg_rel) and uses the publisher's
-	// tag generator; the reliable tag (rmsg.tag) is tracked separately for
-	// ACK correlation but the wire tag is the publisher sequence tag.
-	_ = pub.publishImpl(rmsg.deadline, rmsg.data, HeaderTypeMsgRel)
-}
-
-// handleTimeout handles a timeout for a reliable message.
-func (rd *ReliableDelivery) handleTimeout(tag uint64) {
-	rd.mu.Lock()
-	defer rd.mu.Unlock()
-
-	rmsg, ok := rd.pending[tag]
-	if !ok {
-		return
-	}
-
-	// Check if we've exceeded max retries
-	if rmsg.retryCount >= rd.maxRetries {
-		rmsg.future.complete(ErrDelivery)
-		delete(rd.pending, tag)
-		return
-	}
-
-	// Resend the message
-	rmsg.retryCount++
-	rmsg.sentAt = rd.publisher.cy.Now()
-	
-	// Update the deadline for the next attempt
-	// Use exponential backoff
-	backoff := time.Duration(1<<rmsg.retryCount) * time.Millisecond
-	rmsg.deadline = rd.publisher.cy.Now() + Microsecond(backoff)
-	
-	rd.sendMessage(rmsg)
-
-	// Reschedule timeout
+// armTimeout reschedules the doubling-backoff retransmission timeout for rmsg.
+// Caller holds rd.mu.
+func (rd *ReliableDelivery) armTimeout(rmsg *reliableMessage) {
 	cy := rd.publisher.cy
-	cy.olga.Schedule(int64(rmsg.deadline), func() {
-		rd.handleTimeout(tag)
+	next := cy.Now() + rmsg.ackTimeout
+	if next > rmsg.deadline {
+		next = rmsg.deadline
+	}
+	cy.olga.Schedule(int64(next), func() {
+		rd.handleTimeout(rmsg.tag)
 	})
 }
 
-// HandleAck handles an acknowledgment from a remote.
-func (rd *ReliableDelivery) HandleAck(remoteID, tag uint64) {
+// send transmits rmsg over the wire. It chooses unicast to the single remaining
+// remote when exactly one association is outstanding (C assoc_knockout switch),
+// otherwise multicast via the cached wire bytes. Caller holds rd.mu; this
+// releases rd.mu across the actual send because the platform lock and the
+// publisher lock must be acquired (avoiding lock-order inversion with Publish).
+func (rd *ReliableDelivery) send(rmsg *reliableMessage) error {
+	pub := rd.publisher
+	if len(rmsg.remaining) == 1 {
+		var remoteID uint64
+		for rid := range rmsg.remaining {
+			remoteID = rid
+		}
+		rd.mu.Unlock()
+		lane := Lane{ID: remoteID, Priority: pub.priority}
+		err := pub.cy.platform.Unicast(lane, rmsg.deadline, rmsg.wire)
+		rd.mu.Lock()
+		return err
+	}
+	rd.mu.Unlock()
+	err := pub.sendWire(rmsg.deadline, rmsg.wire)
 	rd.mu.Lock()
-	defer rd.mu.Unlock()
+	return err
+}
+
+// handleTimeout retransmits an unacknowledged message with a doubling backoff.
+func (rd *ReliableDelivery) handleTimeout(tag uint64) {
+	rd.mu.Lock()
 
 	rmsg, ok := rd.pending[tag]
 	if !ok {
+		rd.mu.Unlock()
 		return
 	}
 
-	// Mark this remote as having acknowledged
-	if !rmsg.ackedBy[remoteID] {
-		rmsg.ackedBy[remoteID] = true
-		rmsg.future.Ack()
+	// Double the per-message timeout (C ack_timeout *= 2) and surface transient
+	// scheduler lag. Stop retransmitting once the publish deadline has passed;
+	// the deadline materialization handles final completion.
+	if rd.publisher.cy.Now() >= rmsg.deadline {
+		rd.mu.Unlock()
+		return
 	}
+	rmsg.ackTimeout *= 2
+	rmsg.retryCount++
+	rmsg.sentAt = rd.publisher.cy.Now()
+	rmsg.future.updateError(ErrLag)
 
-	// Check if all remotes have acknowledged
-	if len(rmsg.ackedBy) >= rmsg.future.TotalCount() {
+	if err := rd.send(rmsg); err != nil {
+		// Send failure: treat like a missed deadline at materialization.
+		rd.mu.Unlock()
+		return
+	}
+	rd.armTimeout(rmsg)
+	rd.mu.Unlock()
+}
+
+// materialize finalizes the publication at the publish deadline: OK if fully
+// acknowledged by every known association, otherwise ErrDelivery.
+func (rd *ReliableDelivery) materialize(tag uint64) {
+	rd.mu.Lock()
+	rmsg, ok := rd.pending[tag]
+	if !ok {
+		rd.mu.Unlock()
+		return
+	}
+	delete(rd.pending, tag)
+	rd.mu.Unlock()
+
+	if rmsg.acknowledged && len(rmsg.remaining) == 0 {
 		rmsg.future.complete(OK)
-		delete(rd.pending, tag)
+	} else {
+		rmsg.future.complete(ErrDelivery)
 	}
 }
 
-// HandleNack handles a negative acknowledgment from a remote.
-func (rd *ReliableDelivery) HandleNack(remoteID, tag uint64) {
+// HandleAck handles an acknowledgment from a remote. A known association (one of
+// the remotes expected at publish time) is knocked out of the remaining set and
+// counts toward completion; an ACK from any remote (including an unknown one)
+// confirms the publication. Completion (OK) happens once the publication is
+// acknowledged and every known association has ACKed.
+func (rd *ReliableDelivery) HandleAck(remoteID, tag uint64) {
 	rd.mu.Lock()
-	defer rd.mu.Unlock()
-
 	rmsg, ok := rd.pending[tag]
 	if !ok {
+		rd.mu.Unlock()
 		return
 	}
 
-	rmsg.future.Nack()
+	rmsg.acknowledged = true
+	_, known := rmsg.remaining[remoteID]
+	if known {
+		delete(rmsg.remaining, remoteID)
+	}
+	rd.mu.Unlock()
+
+	// Drop the rd.mu lock before touching the future (its completion may invoke
+	// the user callback). The future methods are themselves idempotent and
+	// self-locking, so no further synchronization is needed here.
+	if known {
+		rmsg.future.Ack() // increments ackedCount, sets acknowledged, completes if fully ACKed
+	} else {
+		rmsg.future.Acknowledge() // sets acknowledged, completes if already fully ACKed
+	}
+}
+
+// HandleNack handles a negative acknowledgment from a remote. Faithful to C:
+// a NACK marks a gap to be repaired by retransmission; the association stays in
+// remaining, and the future is neither completed nor failed.
+func (rd *ReliableDelivery) HandleNack(remoteID, tag uint64) {
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
+	_ = remoteID
+	_ = tag
 }
 
 // AddAssociation adds a new association for a remote subscriber.
@@ -203,7 +270,7 @@ func (rd *ReliableDelivery) AddAssociation(remoteID uint64) {
 
 	if _, ok := rd.associations[remoteID]; !ok {
 		rd.associations[remoteID] = &Association{
-			remoteID:      remoteID,
+			remoteID:     remoteID,
 			lastAckTag:   0,
 			lastNackTag:  0,
 			lastActivity: rd.publisher.cy.Now(),
@@ -219,18 +286,18 @@ func (rd *ReliableDelivery) RemoveAssociation(remoteID uint64) {
 	delete(rd.associations, remoteID)
 }
 
-// GetAssociation returns an association by remote ID.
+// GetAssociation returns the association by remote ID.
 func (rd *ReliableDelivery) GetAssociation(remoteID uint64) *Association {
-	rd.mu.RLock()
-	defer rd.mu.RUnlock()
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
 
 	return rd.associations[remoteID]
 }
 
 // AssociationCount returns the number of associations.
 func (rd *ReliableDelivery) AssociationCount() int {
-	rd.mu.RLock()
-	defer rd.mu.RUnlock()
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
 
 	return len(rd.associations)
 }
@@ -244,28 +311,20 @@ func (rd *ReliableDelivery) Cancel() {
 		rmsg.future.complete(ErrNACK)
 		delete(rd.pending, tag)
 	}
-	
+
 	rd.associations = make(map[uint64]*Association)
 }
 
-// Cleanup removes expired associations and pending messages.
+// Cleanup removes expired associations. Pending-message expiry is handled by the
+// deadline materialization scheduled in Publish; this keeps the association
+// soft-state bounded.
 func (rd *ReliableDelivery) Cleanup(now Microsecond) {
 	rd.mu.Lock()
 	defer rd.mu.Unlock()
 
-	// Remove stale associations
 	for remoteID, assoc := range rd.associations {
-		// Session lifetime check
 		if now-assoc.lastActivity > SessionLifetime {
 			delete(rd.associations, remoteID)
-		}
-	}
-
-	// Remove expired pending messages
-	for tag, rmsg := range rd.pending {
-		if now-rmsg.sentAt > rd.ackTimeout*Microsecond(rmsg.retryCount+1) {
-			rmsg.future.complete(ErrDelivery)
-			delete(rd.pending, tag)
 		}
 	}
 }

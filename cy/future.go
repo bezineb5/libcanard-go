@@ -14,24 +14,24 @@ import (
 type Future interface {
 	// Done returns true if the future has completed (successfully or with an error).
 	Done() bool
-	
+
 	// Error returns the error associated with the future.
 	// If Done() is false, this returns the current transient error (if any).
 	// If Done() is true, this returns the final error.
 	Error() Error
-	
+
 	// SetCallback sets a callback to be invoked when the future completes or updates.
 	// The callback may be invoked multiple times: once when the future completes,
 	// and potentially multiple times for progress updates while pending.
 	// If the future is already completed, the callback will be invoked immediately.
 	SetCallback(callback func(Future))
-	
+
 	// Context returns the user context associated with the future.
 	Context() UserContext
-	
+
 	// SetContext sets the user context for the future.
 	SetContext(context UserContext)
-	
+
 	// Destroy destroys the future and cancels the associated operation if pending.
 	// A future may be destroyed from within its own callback.
 	Destroy()
@@ -156,13 +156,13 @@ func (f *futureBase) updateError(err Error) {
 // It represents a subscription that will receive messages.
 type SubscriptionFuture struct {
 	futureBase
-	
+
 	// sub is the associated subscriber.
 	sub *Subscriber
-	
+
 	// arrival is the last received message arrival.
 	arrival *Arrival
-	
+
 	// mu protects the arrival field.
 	arrivalMu sync.RWMutex
 }
@@ -171,7 +171,7 @@ type SubscriptionFuture struct {
 func NewSubscriptionFuture(sub *Subscriber) *SubscriptionFuture {
 	return &SubscriptionFuture{
 		futureBase: futureBase{},
-		sub:       sub,
+		sub:        sub,
 	}
 }
 
@@ -200,26 +200,47 @@ func (f *SubscriptionFuture) Destroy() {
 
 // PublicationFuture is a future for publication operations.
 // It represents a reliable publication that is waiting for acknowledgments.
+//
+// Faithful port of the C reliable-publish completion model: a publication
+// completes with OK once it has been acknowledged (any ACK at all) AND every
+// known subscriber association at publish time has explicitly ACKed it. NACKs
+// are treated as gaps to be repaired by the retransmission cycle, not as
+// terminal errors: they never complete or fail the future.
 type PublicationFuture struct {
 	futureBase
-	
-	// tag is the message tag for this publication.
+
+	// tag is the message tag for this publication (the wire tag).
 	tag uint64
-	
-	// ackedCount is the number of acknowledgments received.
-	ackedCount int
-	
-	// totalCount is the total number of expected acknowledgments.
+
+	// totalCount is the number of known subscriber associations captured at
+	// publish time. It is the denominator for completion: all of them must
+	// ACK before the future can succeed (alongside any confirming ACK).
 	totalCount int
+
+	// ackedCount is the number of known associations that have ACKed so far.
+	ackedCount int
+
+	// acknowledged is set true on the first (any) ACK, including from a remote
+	// that was not a known association at publish time.
+	acknowledged bool
 }
 
-// NewPublicationFuture creates a new publication future.
+// NewPublicationFuture creates a new publication future for the given wire tag
+// and known-association count.
 func NewPublicationFuture(tag uint64, totalCount int) *PublicationFuture {
 	return &PublicationFuture{
-		futureBase:  futureBase{},
+		futureBase: futureBase{},
 		tag:        tag,
 		totalCount: totalCount,
 	}
+}
+
+// NewFailedPublicationFuture returns a publication future that is already
+// completed with the given error (e.g. when the initial send fails).
+func NewFailedPublicationFuture(err Error) *PublicationFuture {
+	f := &PublicationFuture{futureBase: futureBase{}, tag: 0, totalCount: 0}
+	f.complete(err)
+	return f
 }
 
 // Tag returns the message tag.
@@ -227,45 +248,72 @@ func (f *PublicationFuture) Tag() uint64 {
 	return f.tag
 }
 
-// AckedCount returns the number of acknowledgments received.
+// AckedCount returns the number of known associations that have acknowledged.
 func (f *PublicationFuture) AckedCount() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.ackedCount
 }
 
-// TotalCount returns the total number of expected acknowledgments.
+// TotalCount returns the number of known associations expected to acknowledge
+// at publish time.
 func (f *PublicationFuture) TotalCount() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.totalCount
 }
 
-// Ack records an acknowledgment from a remote.
+// Acknowledged reports whether at least one ACK has been received for this
+// publication (including from an unknown remote).
+func (f *PublicationFuture) Acknowledged() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.acknowledged
+}
+
+// Ack records an acknowledgment from a known association and confirms the
+// publication. Completes with OK once every known association has ACKed and at
+// least one ACK (this or any other) has been seen.
 func (f *PublicationFuture) Ack() {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	if f.done {
+		f.mu.Unlock()
 		return
 	}
-
 	f.ackedCount++
-	
-	// Check if all acknowledgments have been received
-	if f.ackedCount >= f.totalCount {
+	f.acknowledged = true
+	should := f.acknowledged && f.ackedCount >= f.totalCount
+	f.mu.Unlock()
+	if should {
 		f.complete(OK)
 	}
 }
 
-// Nack records a negative acknowledgment from a remote.
+// Acknowledge confirms the publication on any ACK (including from a remote that
+// was not a known association at publish time). Completes with OK once the
+// publication is acknowledged and every known association has also ACKed.
+// Caller must NOT hold f.mu.
+func (f *PublicationFuture) Acknowledge() {
+	f.mu.Lock()
+	if f.done {
+		f.mu.Unlock()
+		return
+	}
+	f.acknowledged = true
+	should := f.acknowledged && f.ackedCount >= f.totalCount
+	f.mu.Unlock()
+	if should {
+		f.complete(OK)
+	}
+}
+
+// Nack is a no-op under the faithful C model: a NACK is a gap signal, repaired
+// by the retransmission cycle, never a terminal error. It neither completes nor
+// fails the future.
 func (f *PublicationFuture) Nack() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	if f.done {
-		return
-	}
-
-	// For now, we just update the error
-	// In a real implementation, we might want to track which remotes NACK'd
-	f.updateError(ErrNACK)
+	_ = f.done
 }
 
 // from the requester. Faithful port of C respond_future_t: it is keyed by respondKey
@@ -334,6 +382,7 @@ func (f *RespondFuture) onAck(positive bool) {
 // ResponseACKTimeoutMicrosecond is the response-ACK retransmission/timeout window,
 // mirroring C ACK_TX_TIMEOUT (1,000,000 us = 1 second).
 const ResponseACKTimeoutMicrosecond = 1000000
+
 // RequestFuture is a future for request operations.
 // It represents a request that is waiting for responses.
 type RequestFuture struct {
@@ -359,13 +408,12 @@ type RequestFuture struct {
 	ack *requestAck
 }
 
-
 // NewRequestFuture creates a new request future.
 func NewRequestFuture(rpc *RPC, tag uint64) *RequestFuture {
 	return &RequestFuture{
 		futureBase: futureBase{},
-		tag:       tag,
-		rpc:       rpc,
+		tag:        tag,
+		rpc:        rpc,
 	}
 }
 
@@ -397,7 +445,7 @@ func (f *RequestFuture) AddResponse(response Response) {
 
 	f.responses = append(f.responses, response)
 	f.responseCount++
-	
+
 	// Keep only the most recent response if we have more than one
 	// (as per the C implementation, the queue length is 1)
 	if len(f.responses) > 1 {
@@ -410,11 +458,11 @@ func (f *RequestFuture) AddResponse(response Response) {
 func (f *RequestFuture) BorrowResponse() *Response {
 	f.responseMu.RLock()
 	defer f.responseMu.RUnlock()
-	
+
 	if len(f.responses) == 0 {
 		return nil
 	}
-	
+
 	return &f.responses[len(f.responses)-1]
 }
 
@@ -423,11 +471,11 @@ func (f *RequestFuture) BorrowResponse() *Response {
 func (f *RequestFuture) MoveResponse() *Response {
 	f.responseMu.Lock()
 	defer f.responseMu.Unlock()
-	
+
 	if len(f.responses) == 0 {
 		return nil
 	}
-	
+
 	// Get the last response
 	response := f.responses[len(f.responses)-1]
 
@@ -436,6 +484,7 @@ func (f *RequestFuture) MoveResponse() *Response {
 
 	return &response
 }
+
 // Destroy destroys the request future. Faithful to C request_future_dispose: the future is
 // de-indexed from the RPC at dispose (so post-destroy retransmits are answered by the handed-off
 // record, never re-delivered into a dead future), and any reliable-response dedup record that
@@ -503,12 +552,12 @@ type Breadcrumb struct {
 // NewBreadcrumb creates a new breadcrumb.
 func NewBreadcrumb(cy *Cy, priority Priority, remoteID, topicHash, messageTag uint64) *Breadcrumb {
 	return &Breadcrumb{
-		Cy:        cy,
-		Priority:  priority,
+		Cy:         cy,
+		Priority:   priority,
 		RemoteID:   remoteID,
 		TopicHash:  topicHash,
 		MessageTag: messageTag,
-		Seqno:     0,
+		Seqno:      0,
 	}
 }
 

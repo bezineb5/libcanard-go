@@ -51,8 +51,8 @@ type Platform struct {
 	canard *libcanard.Canard
 
 	transport frameTransport
-	rxCh     chan can.Frame
-	closed   atomic.Bool
+	rxCh      chan can.Frame
+	closed    atomic.Bool
 
 	// mu guards the non-goroutine-safe *libcanard.Canard and the pending queue.
 	mu      sync.Mutex
@@ -64,6 +64,12 @@ type Platform struct {
 
 	// unicastTID holds the per-remote transfer-ID used for v1.1 unicast transfers.
 	unicastTID [libcanard.NodeIDMax + 1]uint8
+
+	// unicastSub is the persistent libcanard subscription for service 511. It is
+	// reused across SetUnicastExtent calls so that re-subscribing with a larger
+	// extent updates the same libcanard node (rxSubscribe only refreshes an
+	// existing port-ID node when the same subscription pointer is passed).
+	unicastSub *libcanard.Subscription
 
 	// unicastExtent is the maximum size of incoming unicast transfers (service 511).
 	unicastExtent int
@@ -178,7 +184,8 @@ func newPlatform(transport frameTransport, txQueueCapacity, filterCount int, prn
 	if ue <= 0 {
 		ue = 256
 	}
-	if p.canard.SubscribeRequest(&libcanard.Subscription{}, UnicastServiceID, ue, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
+	sub := &libcanard.Subscription{}
+	if p.canard.SubscribeRequest(sub, UnicastServiceID, ue, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
 		OnMessage: func(self *libcanard.Subscription, timestamp int64, priority libcanard.Prio, sourceNodeID uint8, transferID uint8, payload libcanard.Payload) {
 			buf := copyPayload(&payload)
 			p.enqueueUnicast(sourceNodeID, priority, timestamp, buf)
@@ -186,6 +193,7 @@ func newPlatform(transport frameTransport, txQueueCapacity, filterCount int, prn
 	}) == nil {
 		return nil, errors.New("libcanard unicast subscribe failed")
 	}
+	p.unicastSub = sub
 
 	go p.recvLoop()
 	return p, nil
@@ -475,7 +483,23 @@ func (p *Platform) Unicast(lane cy.Lane, deadline cy.Microsecond, data []byte) e
 func (p *Platform) SetUnicastExtent(extent int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// C cy_platform_vtable sets the extent unconditionally and tracks the max.
+	if extent <= p.unicastExtent {
+		return
+	}
 	p.unicastExtent = extent
+	// Re-subscribe on the same subscription pointer so libcanard refreshes the
+	// existing service-511 node's extent (rxSubscribe ignores a different pointer).
+	if p.unicastSub != nil {
+		if p.canard.SubscribeRequest(p.unicastSub, UnicastServiceID, extent, libcanard.DefaultTransferIDTimeoutUs, &libcanard.SubscriptionVTable{
+			OnMessage: func(self *libcanard.Subscription, timestamp int64, priority libcanard.Prio, sourceNodeID uint8, transferID uint8, payload libcanard.Payload) {
+				buf := copyPayload(&payload)
+				p.enqueueUnicast(sourceNodeID, priority, timestamp, buf)
+			},
+		}) == nil {
+			// Non-fatal: old extent stays in effect; surface nothing to caller.
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
