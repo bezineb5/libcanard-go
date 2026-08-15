@@ -163,6 +163,13 @@ func (p *MockPlatform) Spin(deadline cy.Microsecond) error {
 }
 
 // Now returns the current time.
+// SubjectIDModulus returns the subject-ID modulus configured for the mock
+// platform. It mirrors the C platform->subject_id_modulus field; the mock uses
+// the default 16-bit modulus.
+func (p *MockPlatform) SubjectIDModulus() uint32 {
+	return cy.SubjectIDModulus16bit
+}
+
 func (p *MockPlatform) Now() cy.Microsecond {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

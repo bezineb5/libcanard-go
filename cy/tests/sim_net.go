@@ -291,6 +291,13 @@ func (p *SimPlatform) Spin(deadline cy.Microsecond) error {
 }
 
 // Now returns the current time.
+// SubjectIDModulus returns the subject-ID modulus configured for the simulation
+// platform. It mirrors the C platform->subject_id_modulus field; the test network
+// uses the default 16-bit modulus.
+func (p *SimPlatform) SubjectIDModulus() uint32 {
+	return cy.SubjectIDModulus16bit
+}
+
 func (p *SimPlatform) Now() cy.Microsecond {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

@@ -488,6 +488,14 @@ func (p *Platform) Now() cy.Microsecond {
 	return cy.Microsecond(time.Now().UnixMicro())
 }
 
+// SubjectIDModulus returns the subject-ID modulus configured for this platform.
+// It mirrors the C platform->subject_id_modulus field.
+func (p *Platform) SubjectIDModulus() uint32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.subjectIDModulus
+}
+
 // Realloc reallocates memory.
 func (p *Platform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 	if size == 0 {

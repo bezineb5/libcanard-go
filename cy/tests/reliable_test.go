@@ -387,8 +387,8 @@ func TestReliableDeliveryUnicastExtent(t *testing.T) {
 	}
 	defer node.Destroy()
 
-	if node.UnicastExtent() != 0 {
-		t.Fatalf("Expected initial unicast extent 0, got %d", node.UnicastExtent())
+	if node.UnicastExtent() != cy.HeaderSize+100 {
+		t.Fatalf("Expected initial unicast extent %d, got %d", cy.HeaderSize+100, node.UnicastExtent())
 	}
 	topic, err := node.Advertise("test.topic")
 	if err != nil {
