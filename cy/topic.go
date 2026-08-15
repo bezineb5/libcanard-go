@@ -53,6 +53,11 @@ type Topic struct {
 	// dedup holds per-remote reliable-deduplication state. It is only consulted
 	// for reliable (MsgRel) transfers, where ACK loss can cause duplicates.
 	dedup map[uint64]*dedupState
+
+	// userContext is an opaque, application-controlled context associated with the
+	// topic. It mirrors C's cy_user_context_t field on cy_topic_t, surfaced by
+	// cy_topic_user_context().
+	userContext UserContext
 }
 
 // newTopic creates a new topic with the specified name. The name is expected to be
@@ -82,7 +87,6 @@ func newTopic(name string, modulus uint32, pin uint16) (*Topic, error) {
 		refcount: 1,
 		dedup:    make(map[uint64]*dedupState),
 	}
-
 	// Pinned topics encode the subject-ID in the eviction counter as
 	// UINT32_MAX - subject_id, placing it in the reserved pinned range
 	// [EVICTIONS_PINNED_MIN, UINT32_MAX]; this is what lets is_pinned() detect them
@@ -346,4 +350,17 @@ func (t *Topic) String() string {
 	}
 	return fmt.Sprintf("Topic{name:%q, hash:0x%016x, subjectID:%d%s}",
 		t.name, t.hash, t.subjectID, pinnedStr)
+}
+
+// UserContext returns the application-controlled context associated with the
+// topic. It mirrors C's cy_topic_user_context (and the underlying
+// cy_user_context_t field).
+func (t *Topic) UserContext() UserContext {
+	return t.userContext
+}
+
+// SetUserContext sets the application-controlled context associated with the
+// topic.
+func (t *Topic) SetUserContext(ctx UserContext) {
+	t.userContext = ctx
 }

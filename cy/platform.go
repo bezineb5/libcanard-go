@@ -63,6 +63,12 @@ type Platform interface {
 	// The initial time shall be non-negative.
 	Now() Microsecond
 
+	// SubjectIDModulus returns the subject-ID modulus configured for this platform.
+	// It must be a prime congruent to 3 mod 4 and at least SubjectIDModulus16bit.
+	// cy.New reads this to configure the network; it is the Go equivalent of the C
+	// platform->subject_id_modulus field (which the application sets before cy_new).
+	SubjectIDModulus() uint32
+
 	// Realloc reallocates memory. If size is zero, it must behave like free.
 	// Standard realloc semantics.
 	Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer
@@ -120,8 +126,8 @@ type PlatformBase struct {
 	// Cy is the Cy instance tied to this platform.
 	// It is assigned automatically in cy.New and should not be altered.
 	Cy *Cy
-	// SubjectIDModulus is the subject-ID modulus for this platform.
-	SubjectIDModulus uint32
+	// subjectIDModulus is the subject-ID modulus for this platform.
+	subjectIDModulus uint32
 	// OnMessage is the callback for received messages.
 	OnMessage OnMessageCallback
 	// UnicastExtent is the maximum extent for incoming unicast transfers.
@@ -208,4 +214,9 @@ func (p *PlatformBase) Random() uint64 {
 // SetCy sets the Cy instance reference.
 func (p *PlatformBase) SetCy(cy *Cy) {
 	p.Cy = cy
+}
+
+// SubjectIDModulus returns the configured subject-ID modulus.
+func (p *PlatformBase) SubjectIDModulus() uint32 {
+	return p.subjectIDModulus
 }

@@ -2,6 +2,7 @@ package cy
 
 import (
 	"encoding/binary"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -140,6 +141,15 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 		namespace = cfgNS
 	}
 
+	// Read the subject-ID modulus from the platform (C: platform->subject_id_modulus,
+	// set by the application before cy_new). A valid modulus is used directly; if the
+	// platform does not configure one (or returns an invalid value) we fall back to the
+	// 16-bit default so heterogeneous networks that do configure it honor the platform.
+	modulus := platform.SubjectIDModulus()
+	if modulus == 0 || !IsValidSubjectIDModulus(modulus) {
+		modulus = SubjectIDModulus16bit
+	}
+
 	cy := &Cy{
 		platform:             platform,
 		olga:                 olga.New(),
@@ -151,19 +161,23 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 		topicsBySubjectID:    make(map[uint32]*Topic),
 		publishers:           make(map[*Topic]*Publisher),
 		subscribers:          make(map[*Topic][]*Subscriber),
-		unicastExtent:        0,
-		startedAt:            0,
+		unicastExtent:        HeaderSize + 100,
+		startedAt:            platform.Now(),
 		implicitTopicTimeout: ImplicitTopicDefaultTimeout,
 		ackBaselineTimeout:   ACKBaselineDefaultTimeout,
 		gossip:               nil, // Will be initialized below
 		rpc:                  nil, // Will be initialized below
 		crdt:                 nil, // Will be initialized below
 		patternMatcher:       NewPatternMatcher(),
-		subjectIDModulus:     SubjectIDModulus16bit,
+		subjectIDModulus:     modulus,
 		prngState:            0,
 	}
 
 	platform.SetCy(cy)
+
+	// Configure the unicast extent and inform the platform, matching C:
+	// unicast_extent_set(platform, HEADER_BYTES + 100).
+	cy.platform.SetUnicastExtent(HeaderSize + 100)
 
 	// Apply remap rules. Invalid pairs are silently ignored, matching C's
 	// remap_parse contract (only OOM is a hard stop, and Go allocations do not
@@ -177,14 +191,14 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 
 	// Initialize components that need the cy reference
 	cy.rpc = newRPC(cy)
-	cy.crdt = NewCRDT(cy, SubjectIDModulus16bit)
+	cy.crdt = NewCRDT(cy, modulus)
 	cy.gossip = newGossip(cy)
 	cy.scouting = make(map[string]struct{})
 
 	// Set up the gossip/broadcast subject layout. The broadcast subject-ID and the
 	// gossip shard count are derived from the modulus; they must be created before
 	// any topics are allocated so gossip can target the right subjects.
-	cy.subjectIDModulus = SubjectIDModulus16bit
+	cy.subjectIDModulus = modulus
 	cy.broadcastSubjectID = BroadcastSubjectID(cy.subjectIDModulus)
 	cy.gossipBroadcastRatio = GossipBroadcastRatio
 	if err := cy.initBroadcastSubject(); err != nil {
@@ -935,6 +949,59 @@ func (c *Cy) PendingScouts() []string {
 	return out
 }
 
+// TopicIterFirst returns the first topic in ascending subject-hash order, or nil
+// if there are no topics. It mirrors C's cy_topic_iter_first (which returns the
+// minimum of the topics-by-hash index).
+func (c *Cy) TopicIterFirst() *Topic {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := c.sortedTopicHashesLocked()
+	if len(keys) == 0 {
+		return nil
+	}
+	return c.topicsByHash[keys[0]]
+}
+
+// TopicIterNext returns the topic with the next greater subject-hash after the
+// given topic, or nil if it is the last or the argument is nil. It mirrors C's
+// cy_topic_iter_next.
+func (c *Cy) TopicIterNext(topic *Topic) *Topic {
+	if topic == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := c.sortedTopicHashesLocked()
+	idx := sort.Search(len(keys), func(i int) bool { return keys[i] >= topic.hash })
+	if idx >= len(keys) || keys[idx] != topic.hash {
+		return nil
+	}
+	if idx+1 >= len(keys) {
+		return nil
+	}
+	return c.topicsByHash[keys[idx+1]]
+}
+
+// sortedTopicHashesLocked returns the topic subject-hashes sorted ascending.
+// The caller must hold c.mu (at least RLock).
+func (c *Cy) sortedTopicHashesLocked() []uint64 {
+	keys := make([]uint64, 0, len(c.topicsByHash))
+	for h := range c.topicsByHash {
+		keys = append(keys, h)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+// TopicUserContext returns the user context of the given topic. It mirrors C's
+// cy_topic_user_context. A nil topic yields an empty context.
+func TopicUserContext(topic *Topic) UserContext {
+	if topic == nil {
+		return EmptyUserContext()
+	}
+	return topic.UserContext()
+}
+
 // SetSubjectIDModulus sets the subject-ID modulus for the network.
 // The modulus is validated: it must be a prime number congruent to 3 mod 4 and at
 // least SubjectIDModulus16bit, otherwise the quadratic-probing subject-ID
@@ -1098,6 +1165,34 @@ func hashBytes(b []byte) uint64 {
 // Platform returns the underlying platform.
 func (c *Cy) Platform() Platform {
 	return c.platform
+}
+
+// Uptime returns the time elapsed since cy.New() in microseconds. It is the Go
+// equivalent of C's cy_uptime (computed as cy_now() - ts_started).
+func (c *Cy) Uptime() Microsecond {
+	return c.Now() - c.startedAt
+}
+
+// Home returns the node's home directory (verbatim form, as provided to New).
+// It mirrors C's cy_home (the normalized platform->home).
+func (c *Cy) Home() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.home
+}
+
+// Namespace returns the node's namespace (may be empty). It mirrors C's
+// cy_namespace.
+func (c *Cy) Namespace() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ns
+}
+
+// SpinOnce updates the event loop once without blocking, matching C's inline
+// cy_spin_once (which is cy_spin_until(cy, 0)).
+func (c *Cy) SpinOnce() error {
+	return c.SpinUntil(0)
 }
 
 // SetUnicastExtent sets the maximum extent for incoming unicast messages.
