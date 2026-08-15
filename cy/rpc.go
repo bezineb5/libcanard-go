@@ -28,6 +28,15 @@ type RPC struct {
 	// response future, mirroring C cy->respond_futures_by_tag. Each reliable
 	// response we transmit awaits a unicast ACK/NACK from the requester.
 	respondFutures map[uint64]*RespondFuture
+
+	// requestAcks holds handed-off requester-side dedup records that outlive a destroyed
+	// RequestFuture. Keyed by message_tag (faithful to C request_acks_by_tag). They answer
+	// retransmitted reliable responses after the application is gone. Swept by requestAckExpiry.
+	requestAcks map[uint64]*requestAck
+
+	// requestAckExpiry is the MRU list of handed-off records by expiry (faithful to C
+	// request_acks_by_expiry, head==newest). Sweep drops the oldest (tail) once deadAt < now.
+	requestAckExpiry []uint64
 }
 
 // respondKey computes the response-ACK correlation key, a faithful port of C respond_key():
@@ -36,6 +45,192 @@ type RPC struct {
 func respondKey(remoteID, messageTag, hash, seqno uint64, tag byte) uint64 {
 	return remoteID ^ messageTag ^ hash ^ (seqno << 16) ^ (uint64(tag) << 56)
 }
+
+// responseRx is the verdict for a received response, faithful to C response_rx_t.
+type responseRx int
+
+const (
+	responseRxAck    responseRx = 0 // Acknowledge: response is fresh/known, wire ACK.
+	responseRxNack   responseRx = 1 // Negative acknowledge: too old / not accepted, wire NACK.
+	responseRxSilent responseRx = 2 // Transient local drop: no ACK/NACK, keep future pending.
+)
+
+// requestFutureHistory is the number of most-recent seqnos tracked per remote (C REQUEST_FUTURE_HISTORY).
+const requestFutureHistory = 192
+
+// RequestAckRetentionMicrosecond is how long a handed-off ack record answers retransmits after the
+// RequestFuture is destroyed (C CY_CONFIG_REQUEST_ACK_RETENTION_us == SESSION_LIFETIME == 60e6 us).
+const RequestAckRetentionMicrosecond = 60000000
+
+// bitmapWords is BITMAP_WORDS(n) = ceil(n/64).
+func bitmapWords(bits int) int { return (bits + 63) / 64 }
+
+func bitmapSet(bitmap []uint64, bit int) {
+	bitmap[bit/64] |= 1 << uint(bit%64)
+}
+
+func bitmapTest(bitmap []uint64, bit int) bool {
+	return (bitmap[bit/64] & (1 << uint(bit%64))) != 0
+}
+
+// bitmapTestBounded mirrors C bitmap_test_bounded: out-of-range bits are not set.
+func bitmapTestBounded(bitmap []uint64, bitCount, bit int) bool {
+	return bit < bitCount && bitmapTest(bitmap, bit)
+}
+
+// bitmapShiftLeft faithfully ports C bitmap_shift with a positive (left) shift_amount:
+// whole-word shift first, then partial-bit carry. Used when a remote's seqno frontier advances.
+// REQUEST_FUTURE_HISTORY is a multiple of 64, so no tail masking is needed for our case.
+
+// retainRequestAck hands off a RequestFuture's dedup record to the RPC so it keeps answering
+// retransmits after the future is destroyed. Faithful to C request_ack_retain: sets the real
+// deadline and inserts by tag + enlists head (newest) by expiry. Caller holds r.mu.
+func (r *RPC) retainRequestAck(ack *requestAck, now Microsecond) {
+	ack.deadAt = now + RequestAckRetentionMicrosecond
+	r.requestAcks[ack.tag] = ack
+	r.requestAckExpiry = append(r.requestAckExpiry, ack.tag)
+}
+
+// sweepRequestAcks drops expired handed-off records (oldest-first). Faithful to C
+// request_ack_drop_stale. Caller holds r.mu.
+func (r *RPC) sweepRequestAcks(now Microsecond) {
+	for len(r.requestAckExpiry) > 0 {
+		oldest := r.requestAckExpiry[0]
+		ack := r.requestAcks[oldest]
+		if ack == nil || ack.deadAt >= now {
+			break
+		}
+		delete(r.requestAcks, oldest)
+		r.requestAckExpiry = r.requestAckExpiry[1:]
+	}
+}
+func bitmapShiftLeft(bitmap []uint64, shift int) {
+	if shift == 0 {
+		return
+	}
+	words := len(bitmap)
+	if shift >= requestFutureHistory {
+		for i := 0; i < words; i++ {
+			bitmap[i] = 0
+		}
+		return
+	}
+	whole := shift / 64
+	part := shift % 64
+	if whole > 0 {
+		for i := words - 1; i >= 0; i-- {
+			if i >= whole {
+				bitmap[i] = bitmap[i-whole]
+			} else {
+				bitmap[i] = 0
+			}
+		}
+	}
+	if part > 0 {
+		for i := words - 1; i >= 0; i-- {
+			carry := uint64(0)
+			if i > 0 {
+				carry = bitmap[i-1] >> uint(64-part)
+			}
+			bitmap[i] = (bitmap[i] << uint(part)) | carry
+		}
+	}
+}
+
+// requestAckRemote is the per-remote dedup state, faithful to C request_future_remote_t.
+// bit 0 == seqnoTop, bit 1 == seqnoTop-1, ..., in the seqnoAcked bitmap.
+type requestAckRemote struct {
+	remoteID  uint64
+	seqnoTop  uint64
+	seqnoAcked [3]uint64 // bitmapWords(REQUEST_FUTURE_HISTORY) == 3
+}
+
+// requestAck is the requester-side reliable-response deduplication record.
+// Faithful to C request_ack_t. It is owned by the RequestFuture until the future is destroyed,
+// at which point it is handed over to RPC.requestAcks to answer retransmits on its own.
+//   solo  -- a single remote (soloRemoteID) acked seqno 0.
+//   !solo -- promoted: per-remote bitmaps (tree), same rule as the live path.
+//   !solo, empty tree -- nothing acked, answers NACK to everything (never retained).
+type requestAck struct {
+	tag         uint64
+	deadAt      Microsecond
+	solo        bool
+	soloRemoteID uint64
+	tree        map[uint64]*requestAckRemote
+}
+
+// test answers a retransmitted reliable response from (remoteID, seqno) without involving the
+// application. Faithful to C request_ack_test.
+func (a *requestAck) test(remoteID, seqno uint64) bool {
+	if a == nil {
+		return false
+	}
+	if a.solo {
+		return a.soloRemoteID == remoteID && seqno == 0
+	}
+	remote, ok := a.tree[remoteID]
+	if !ok {
+		return false
+	}
+	if seqno > remote.seqnoTop {
+		return false
+	}
+	return bitmapTestBounded(remote.seqnoAcked[:], requestFutureHistory, int(remote.seqnoTop-seqno))
+}
+
+// admit processes an incoming reliable response from (remoteID, seqno) and returns the wire verdict.
+// It sets *outFresh true iff the response is genuinely new and must reach the application.
+// Faithful to C request_ack_admit.
+func (a *requestAck) admit(remoteID, seqno uint64, outFresh *bool) responseRx {
+	*outFresh = false
+	if a.solo {
+		if a.soloRemoteID == remoteID && seqno == 0 {
+			return responseRxAck // Duplicate of the inlined ack; no promotion needed.
+		}
+		// Promote the solo slot into a tree, carrying over the inlined ack (seqno 0).
+		node := &requestAckRemote{remoteID: a.soloRemoteID, seqnoTop: 0}
+		bitmapSet(node.seqnoAcked[:], 0)
+		if a.tree == nil {
+			a.tree = make(map[uint64]*requestAckRemote)
+		}
+		a.tree[a.soloRemoteID] = node
+		a.solo = false
+		// Fall through to the generic per-remote path for the current remote.
+	} else if a.tree == nil && seqno == 0 {
+		// Empty record: claim the solo slot.
+		a.solo = true
+		a.soloRemoteID = remoteID
+		*outFresh = true
+		return responseRxAck
+	}
+
+	// Generic per-remote path.
+	if a.tree == nil {
+		a.tree = make(map[uint64]*requestAckRemote)
+	}
+	remote, ok := a.tree[remoteID]
+	if !ok {
+		remote = &requestAckRemote{remoteID: remoteID, seqnoTop: 0}
+		a.tree[remoteID] = remote
+	}
+	if seqno > remote.seqnoTop {
+		bitmapShiftLeft(remote.seqnoAcked[:], int(seqno-remote.seqnoTop))
+		bitmapSet(remote.seqnoAcked[:], 0) // 0th bit is always the current frontier.
+		remote.seqnoTop = seqno
+	} else {
+		dist := remote.seqnoTop - seqno
+		if dist >= requestFutureHistory {
+			return responseRxNack // Too old: exceeds history, do not accept.
+		}
+		if bitmapTest(remote.seqnoAcked[:], int(dist)) {
+			return responseRxAck // Duplicate, probably lost ack.
+		}
+		bitmapSet(remote.seqnoAcked[:], int(dist)) // Genuinely new out-of-order response.
+	}
+	*outFresh = true
+	return responseRxAck
+}
+
 
 // RequestHandler is a function that handles incoming requests.
 // It receives the request data and a responder for sending responses.
@@ -71,9 +266,9 @@ func newRPC(cy *Cy) *RPC {
 		services:      make(map[uint32]RequestHandler),
 		streams:       make(map[uint64]*Streaming),
 		respondFutures: make(map[uint64]*RespondFuture),
-	}
+		requestAcks:    make(map[uint64]*requestAck),
 }
-
+}
 // Request sends a request message and returns a future for responses.
 // The deliveryDeadline is when the request must be delivered by.
 // The responseTimeout is how long to wait for responses after delivery.
@@ -88,7 +283,7 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 	r.nextRequestTag++
 
 	// Create the future
-	future := NewRequestFuture(tag)
+	future := NewRequestFuture(r, tag)
 	r.requests[tag] = future
 	r.mu.Unlock()
 
@@ -141,7 +336,61 @@ func (r *RPC) handleResponseTimeout(tag uint64, future *RequestFuture) {
 	delete(r.requests, tag)
 }
 
-// HandleResponse handles an incoming response to a request.
+// handleResponseCorrelation processes an incoming response for the given message tag, faithfully
+// porting C request_on_response + the header_rsp_rel branch.
+//   - If a RequestFuture is live: reliable responses are deduplicated via its ack record; a fresh
+//     response is delivered (app sees it once) and ACKed, a duplicate/old one is ACKed/NACKed but
+//     NOT delivered, best-effort responses are always delivered (silent, no wire ACK).
+//   - If the future is gone but a handed-off ack record exists (post-destroy): a reliable response
+//     is answered from the record (ACK/NACK) without involving the app.
+//   - Otherwise an orphan reliable response is NACKed; an orphan best-effort response is dropped.
+// Returns the wire verdict (responseRxSilent means no ACK/NACK is to be sent). Caller holds r.mu.
+func (r *RPC) handleResponseCorrelation(messageTag, remoteID, seqno uint64, reliable bool, response Response) responseRx {
+	future, ok := r.requests[messageTag]
+	if !ok {
+		// Future is gone. A reliable retransmit is still answerable from a handed-off record.
+		if !reliable {
+			return responseRxSilent
+		}
+		if ack, found := r.requestAcks[messageTag]; found && ack.test(remoteID, seqno) {
+			return responseRxAck
+		}
+		return responseRxNack
+	}
+
+	if !reliable {
+		// Best-effort: always deliver, never ACK, keep the future pending.
+		future.AddResponse(response)
+		r.scheduleResponseLiveness(messageTag, future)
+		return responseRxSilent
+	}
+
+	// Reliable: deduplicate.
+	if future.ack == nil {
+		future.ack = &requestAck{tag: messageTag}
+	}
+	var fresh bool
+	verdict := future.ack.admit(remoteID, seqno, &fresh)
+	if !fresh {
+		return verdict // Duplicate, too old, or transient: app must not see it.
+	}
+	// Fresh reliable response: deliver exactly once.
+	future.AddResponse(response)
+	r.scheduleResponseLiveness(messageTag, future)
+	return responseRxAck
+}
+
+// scheduleResponseLiveness resets the inter-response liveness timeout, mirroring C's
+// future_deadline_arm after a newly admitted response.
+func (r *RPC) scheduleResponseLiveness(tag uint64, future *RequestFuture) {
+	r.cy.olga.Schedule(int64(r.cy.Now()+responseTimeout), func() {
+		r.handleResponseTimeout(tag, future)
+	})
+}
+
+// HandleResponse is retained for backward compatibility / external callers: it delivers a
+// response to a live RequestFuture, treating it as best-effort (always delivered, no ack).
+// New faithful reliable handling goes through handleResponseCorrelation.
 func (r *RPC) HandleResponse(tag uint64, response Response) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -150,15 +399,10 @@ func (r *RPC) HandleResponse(tag uint64, response Response) {
 	if !ok {
 		return
 	}
-
-	// Add the response to the future
 	future.AddResponse(response)
-
-	// Reset the liveness timeout
-	r.cy.olga.Schedule(int64(r.cy.Now()+responseTimeout), func() {
-		r.handleResponseTimeout(tag, future)
-	})
+	r.scheduleResponseLiveness(tag, future)
 }
+
 
 // HandleRequest handles an incoming request. The request payload (after the 24-byte
 // header has been skipped by HandleMessage) carries [tag:8][requestID:4][serviceID:4][data].

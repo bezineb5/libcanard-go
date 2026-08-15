@@ -341,23 +341,31 @@ type RequestFuture struct {
 
 	// tag is the message tag for this request.
 	tag uint64
-	
+
+	// rpc is the owning RPC, used to hand off the ack record at Destroy.
+	rpc *RPC
+
 	// responses contains received responses.
 	responses []Response
-	
+
 	// responseCount is the total number of responses received.
 	responseCount uint64
-	
+
 	// mu protects the responses slice.
 	responseMu sync.RWMutex
+
+	// ack is the requester-side reliable-response dedup record, lazily created on the first
+	// reliable response. Handed off to RPC at Destroy so retransmits keep getting answered.
+	ack *requestAck
 }
 
+
 // NewRequestFuture creates a new request future.
-func NewRequestFuture(tag uint64) *RequestFuture {
+func NewRequestFuture(rpc *RPC, tag uint64) *RequestFuture {
 	return &RequestFuture{
 		futureBase: futureBase{},
 		tag:       tag,
-		responses: make([]Response, 0),
+		rpc:       rpc,
 	}
 }
 
@@ -422,19 +430,28 @@ func (f *RequestFuture) MoveResponse() *Response {
 	
 	// Get the last response
 	response := f.responses[len(f.responses)-1]
-	
+
 	// Remove it from the slice
 	f.responses = f.responses[:len(f.responses)-1]
-	
+
 	return &response
 }
-
-// Destroy destroys the request future.
+// Destroy destroys the request future. If it carried a reliable-response dedup record that
+// acked anything, the record is handed off to the RPC so retransmitted reliable responses keep
+// getting answered after the application is gone (faithful to C request_future_dispose).
 func (f *RequestFuture) Destroy() {
-	f.futureBase.Destroy()
 	f.responseMu.Lock()
+	ack := f.ack
 	f.responses = nil
 	f.responseMu.Unlock()
+
+	if ack != nil && f.rpc != nil && (ack.solo || ack.tree != nil) {
+		f.rpc.mu.Lock()
+		f.rpc.retainRequestAck(ack, f.rpc.cy.Now())
+		f.rpc.mu.Unlock()
+	}
+
+	f.futureBase.Destroy()
 }
 
 // Response represents a response to a request.
