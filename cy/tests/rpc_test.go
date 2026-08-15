@@ -324,10 +324,18 @@ func TestRespondReliableHandshake(t *testing.T) {
 	reqLane := cy.Lane{ID: remoteID} // lane.ID is the responder (source of the response).
 	requester.HandleMessage(reqLane, nil, *reqMsgTS)
 
-	if len(requesterPlat.ReceivedMessages) != 1 {
-		t.Fatalf("expected 1 ACK from requester, got %d", len(requesterPlat.ReceivedMessages))
+	// The requester's platform now records the request it sent (synchronously, when
+	// Request() was called) followed by the response ACK emitted above. Find the ACK
+	// by type rather than relying on count/position.
+	var ackWire []byte
+	for _, m := range requesterPlat.ReceivedMessages {
+		if p, perr := cy.ParseResponseHeader(m.Data); perr == nil && p.Type == cy.HeaderTypeRspAck {
+			ackWire = m.Data
+		}
 	}
-	ackWire := requesterPlat.ReceivedMessages[0].Data
+	if ackWire == nil {
+		t.Fatalf("expected a response ACK from requester, got %d recorded messages", len(requesterPlat.ReceivedMessages))
+	}
 	ackParsed, aerr := cy.ParseResponseHeader(ackWire)
 	if aerr != nil {
 		t.Fatalf("ParseResponseHeader(ack): %v", aerr)

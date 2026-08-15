@@ -167,9 +167,19 @@ func TestRequesterBestEffortAlwaysDelivered(t *testing.T) {
 	if fut.ResponseCount() != 1 {
 		t.Fatalf("best-effort response should be delivered, got %d", fut.ResponseCount())
 	}
-	// No wire ACK/NACK for best-effort.
-	if len(reqPlat.ReceivedMessages) != 0 {
-		t.Fatalf("best-effort must not emit an ACK/NACK, got %d messages", len(reqPlat.ReceivedMessages))
+	// No wire ACK/NACK for best-effort. The requester's own outgoing request is
+	// recorded by Request() (synchronous), so we must only verify that no ACK/NACK
+	// was emitted, not that the inbox is empty.
+	ackNack := 0
+	for _, m := range reqPlat.ReceivedMessages {
+		if p, err := cy.ParseResponseHeader(m.Data); err == nil &&
+			(p.Type == cy.HeaderTypeRspAck || p.Type == cy.HeaderTypeRspNack ||
+				p.Type == cy.HeaderTypeMsgAck || p.Type == cy.HeaderTypeMsgNack) {
+			ackNack++
+		}
+	}
+	if ackNack != 0 {
+		t.Fatalf("best-effort must not emit an ACK/NACK, got %d", ackNack)
 	}
 
 	// A second best-effort response with the same seqno is also delivered (no dedup for best-effort).

@@ -298,7 +298,10 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 	})
 
 	// Send the request as a unicast with the 24-byte Cy session header.
-	go r.sendRequestMessage(pub, tag, deliveryDeadline, data)
+	// The send is synchronous (matching C cy_request), so the request is recorded
+	// before Request returns. This avoids a background goroutine racing with test
+	// code that inspects the platform's recorded messages.
+	r.sendRequestMessage(pub, tag, deliveryDeadline, data)
 
 	return future
 }
