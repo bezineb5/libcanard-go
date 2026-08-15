@@ -3,7 +3,7 @@ package uavcan
 import (
 	"testing"
 
-	"github.com/benjamin/libcanard-go/dsdl"
+	"github.com/bezineb5/libcanard-go/dsdl"
 )
 
 func TestHeartbeatMarshalUnmarshal(t *testing.T) {
