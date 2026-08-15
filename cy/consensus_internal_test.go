@@ -10,7 +10,8 @@ import (
 // controlling the clock via Now().
 type testPlatform struct {
 	PlatformBase
-	nowValue Microsecond
+	nowValue  Microsecond
+	failSends bool
 }
 
 type testWriter struct{ subjectID uint32 }
@@ -45,6 +46,22 @@ func (p *testPlatform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 		return unsafe.Pointer(&b[0])
 	}
 	return ptr
+}
+
+// SubjectWriterSend overrides PlatformBase to optionally fail on demand.
+func (p *testPlatform) SubjectWriterSend(w SubjectWriter, deadline Microsecond, priority Priority, message []byte) error {
+	if p.failSends {
+		return ErrMedia
+	}
+	return nil
+}
+
+// Unicast overrides PlatformBase to optionally fail on demand.
+func (p *testPlatform) Unicast(lane Lane, deadline Microsecond, message []byte) error {
+	if p.failSends {
+		return ErrMedia
+	}
+	return nil
 }
 
 func newTestCy(t *testing.T) (*Cy, *testPlatform) {

@@ -84,6 +84,12 @@ type Cy struct {
 
 	// mu protects the Cy instance from concurrent access.
 	mu sync.RWMutex
+	// diagMu guards the diagnostics listener list (diags). It is intentionally
+	// separate from mu so diagnostics dispatches do not deadlock with, and are
+	// unaffected by, the main instance lock.
+	diagMu sync.Mutex
+	// diags is the singly-linked list of installed diagnostics listeners.
+	diags *Diag
 
 	// onMessage is the callback for received messages.
 	onMessage func(lane Lane, subjectID *uint32, message MessageTS)
@@ -217,6 +223,10 @@ func (c *Cy) Destroy() {
 
 // destroyTopic destroys a topic and all its associated state.
 func (c *Cy) destroyTopic(topic *Topic) {
+	// Report destruction to diagnostics listeners first, mirroring C's
+	// diag_topic_destroyed placement at the start of topic destruction.
+	c.DiagTopicDestroyed(topic)
+
 	// Remove from all maps
 	delete(c.topicsByName, topic.name)
 	delete(c.topicsByHash, topic.hash)
@@ -461,6 +471,10 @@ func (c *Cy) sendScout(pattern string) error {
 	deadline := now + MEGA
 	data := MarshalScout(pattern)
 	if err := c.platform.SubjectWriterSend(c.broadWriter, deadline, PriorityNominal, data); err != nil {
+		// Resubscription / scout broadcast failure during a consensus update. Keep
+		// the pattern in the scouting set so it is retried; also surface it to
+		// diagnostics listeners (C: ON_ASYNC_ERROR_IF after do_send_scout).
+		c.DiagAsyncError(nil, errorToCyErr(err))
 		return err
 	}
 	delete(c.scouting, pattern)
@@ -714,6 +728,10 @@ func (c *Cy) findOrCreateTopic(name string, extent int) (*Topic, error) {
 	// Schedule gossip for this topic so the network learns our allocation.
 	c.gossip.ScheduleUrgent(c, topic)
 
+	// Report the new topic to diagnostics listeners (after its allocation is
+	// committed, mirroring C's diag_topic_created placement).
+	c.DiagTopicCreated(topic)
+
 	return topic, nil
 }
 
@@ -860,6 +878,7 @@ func (c *Cy) topicAllocate(topic *Topic, newEvictions uint32, now Microsecond) {
 		topic.subjectID = ^newEvictions
 		c.resyncTopicReader(topic)
 		c.gossip.ScheduleUrgent(c, topic)
+		c.DiagTopicReallocated(topic, topic.subjectID, topic.evictions)
 		return
 	}
 
@@ -891,6 +910,7 @@ func (c *Cy) topicAllocate(topic *Topic, newEvictions uint32, now Microsecond) {
 		c.topicsBySubjectID[newSid] = topic
 		c.resyncTopicReader(topic)
 		c.gossip.ScheduleUrgent(c, topic)
+		c.DiagTopicReallocated(topic, topic.subjectID, topic.evictions)
 
 		// Recursively re-evict the defeated topic onto a new subject-ID.
 		if that != nil {

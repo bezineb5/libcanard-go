@@ -235,6 +235,7 @@ func (g *Gossip) SendGossip(cy *Cy, topic *Topic, urgent bool) error {
 		} else {
 			w, err := g.getWriter(cy, cy.shardSubjectFor(topic.hash))
 			if err != nil {
+				cy.DiagAsyncError(topic, errorToCyErr(err))
 				return err
 			}
 			writer = w
@@ -248,7 +249,11 @@ func (g *Gossip) SendGossip(cy *Cy, topic *Topic, urgent bool) error {
 	data := MarshalGossipMessage(int8(topic.Lage(now)), topic.Hash(), uint64(topic.Evictions()), topic.GossipName())
 
 	deadline := now + Microsecond(g.period)
-	return cy.platform.SubjectWriterSend(writer, deadline, PriorityLow, data)
+	if err := cy.platform.SubjectWriterSend(writer, deadline, PriorityLow, data); err != nil {
+		cy.DiagAsyncError(topic, errorToCyErr(err))
+		return err
+	}
+	return nil
 }
 
 // sendGossipUnicast sends a single gossip for a topic directly to a remote node
@@ -265,7 +270,11 @@ func (g *Gossip) sendGossipUnicast(cy *Cy, topic *Topic, lane Lane) error {
 	if prio == 0 {
 		prio = PriorityNominal
 	}
-	return cy.platform.Unicast(lane, deadline, data)
+	if err := cy.platform.Unicast(lane, deadline, data); err != nil {
+		cy.DiagAsyncError(topic, errorToCyErr(err))
+		return err
+	}
+	return nil
 }
 
 // ProcessGossip handles a received gossip message. The 24-byte header has already
@@ -293,6 +302,9 @@ func (c *Cy) onGossip(now Microsecond, hash uint64, evictions uint32, lage int32
 	} else {
 		c.onGossipUnknownTopic(hash, evictions, int32(lage), now)
 	}
+	// Always report a processed gossip to diagnostics listeners, mirroring
+	// C diag_gossip_processed (mine is nil if no local topic is known).
+	c.DiagGossipProcessed(mine, name, hash)
 }
 
 // onGossipKnownTopic handles gossip for a locally known topic (same hash).
@@ -366,6 +378,10 @@ func (c *Cy) topicSubscribeIfMatching(name string, hash uint64, evictions uint32
 	}
 	topic, err := newTopic(name, c.subjectIDModulus)
 	if err != nil {
+		// Implicit subscription could not be created (e.g. lack of memory or an
+		// invalid name). Surface it to diagnostics listeners (C: ON_ASYNC_ERROR_IF
+		// on topic_subscribe_if_matching OOM) and skip the implicit subscription.
+		c.DiagAsyncError(nil, errorToCyErr(err))
 		return nil
 	}
 	topic.extent = DefaultTopicExtent
