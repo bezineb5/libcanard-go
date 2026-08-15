@@ -369,6 +369,11 @@ func (c *Cy) onGossipUnknownTopic(hash uint64, evictions uint32, lage int32, now
 // topic_subscribe_if_matching(). Returns the (possibly newly created) topic, or
 // nil if there is no matching pattern. The caller must hold c.mu.
 func (c *Cy) topicSubscribeIfMatching(name string, hash uint64, evictions uint32, lage int32, now Microsecond) *Topic {
+	// Reject malformed gossip names: they must be already-normalized and verbatim
+	// (no substitution tokens), matching C topic_subscribe_if_matching's guard.
+	if _, ok := normalizeName(name); !ok || !nameIsVerbatim(name) {
+		return nil
+	}
 	if len(c.patternMatcher.Match(name)) == 0 {
 		return nil
 	}
@@ -376,7 +381,7 @@ func (c *Cy) topicSubscribeIfMatching(name string, hash uint64, evictions uint32
 	if existing, ok := c.topicsByName[name]; ok {
 		return existing
 	}
-	topic, err := newTopic(name, c.subjectIDModulus)
+	topic, err := newTopic(name, c.subjectIDModulus, PinNone)
 	if err != nil {
 		// Implicit subscription could not be created (e.g. lack of memory or an
 		// invalid name). Surface it to diagnostics listeners (C: ON_ASYNC_ERROR_IF

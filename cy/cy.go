@@ -2,6 +2,7 @@ package cy
 
 import (
 	"encoding/binary"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -95,11 +96,48 @@ type Cy struct {
 	onMessage func(lane Lane, subjectID *uint32, message MessageTS)
 }
 
+// remapPair is a single from=to remap rule parsed from a configuration string.
+type remapPair struct {
+	from string
+	to   string
+}
+
+// parseRemapConfig tokenizes a remap configuration string of the form
+// ["=namespace"] ("from=to" "from=to" ...). Whitespace separates tokens; the
+// first token beginning with '=' (with content after it) is the namespace, and
+// the remaining tokens are from=to pairs (a token without '=' is skipped).
+// Mirrors C's namespace_parse() + remap_parse().
+func parseRemapConfig(cfg string) (ns string, pairs []remapPair) {
+	fields := strings.Fields(cfg)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if strings.HasPrefix(fields[0], "=") {
+		ns = fields[0][1:]
+		fields = fields[1:]
+	}
+	for _, tok := range fields {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			continue
+		}
+		pairs = append(pairs, remapPair{from: tok[:eq], to: tok[eq+1:]})
+	}
+	return ns, pairs
+}
+
 // New creates a new Cy instance with the specified platform and node name.
 // The namespace and remapConfig are optional and can be empty strings.
 func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 	if platform == nil {
 		return nil, ErrArgument
+	}
+
+	// Parse the optional remap/namespace configuration. A leading "=ns" token in
+	// remapConfig supplies the namespace when the explicit namespace argument is empty.
+	cfgNS, pairs := parseRemapConfig(remapConfig)
+	if namespace == "" && cfgNS != "" {
+		namespace = cfgNS
 	}
 
 	cy := &Cy{
@@ -125,13 +163,13 @@ func New(platform Platform, home, namespace, remapConfig string) (*Cy, error) {
 		prngState:            0,
 	}
 
-	// Set up the platform
 	platform.SetCy(cy)
 
-	// Parse remap configuration
-	if remapConfig != "" {
-		// TODO: Parse remap config string
-		// Format: "from1=to1 from2=to2 ..."
+	// Apply remap rules. Invalid pairs are silently ignored, matching C's
+	// remap_parse contract (only OOM is a hard stop, and Go allocations do not
+	// surface as ErrMemory here).
+	for _, p := range pairs {
+		_ = cy.Remap(p.from, p.to)
 	}
 
 	// Set up the olga scheduler's time function
@@ -582,11 +620,8 @@ func (c *Cy) Advertise(topicName string) (*Publisher, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Resolve the topic name (apply namespace and remapping)
-	resolvedName := c.resolveTopicName(topicName)
-
-	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName, DefaultTopicExtent)
+	// Resolve and find or create the topic (applies namespace, remapping, and pin).
+	topic, err := c.findOrCreateTopic(topicName, DefaultTopicExtent)
 	if err != nil {
 		return nil, err
 	}
@@ -617,8 +652,12 @@ func (c *Cy) Subscribe(topicName string, extent int) (*Subscriber, error) {
 // caller; this lets the auto-subscribe (gossip) path subscribe from within the
 // handle-message critical section without re-entering the lock.
 func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subscriber, error) {
-	// Resolve the topic name
-	resolvedName := c.resolveTopicName(topicName)
+	// Resolve the topic name (applies namespace, remapping, pin, and validation).
+	resolved := c.Resolve(topicName)
+	if !resolved.Ok {
+		return nil, ErrName
+	}
+	resolvedName := resolved.Name
 
 	// Check if this is a pattern subscription
 	if IsPattern(resolvedName) {
@@ -643,7 +682,7 @@ func (c *Cy) subscribeLocked(topicName string, extent int, ordered bool) (*Subsc
 	}
 
 	// Find or create the topic
-	topic, err := c.findOrCreateTopic(resolvedName, extent)
+	topic, err := c.findOrCreateTopicResolved(resolved, extent)
 	if err != nil {
 		return nil, err
 	}
@@ -667,33 +706,74 @@ func (c *Cy) SubscribeOrdered(topicName string, extent int) (*Subscriber, error)
 	return c.subscribeLocked(topicName, extent, true)
 }
 
-// resolveTopicName applies namespace and remapping to a topic name.
-func (c *Cy) resolveTopicName(name string) string {
-	// Apply namespace prefix if the name doesn't start with /
-	if c.ns != "" && len(name) > 0 && name[0] != '/' {
-		name = c.ns + "/" + name
+// Remap installs (or replaces) a name remapping rule: a subscription/advertise of
+// a name matching the normalized `from` is transparently rewritten to `to` before
+// namespace/home expansion. The `to` value is stored verbatim (so it may be
+// absolute, homeful, relative, and may itself carry a pin). A pinned `to` must not
+// be a pattern. It mirrors C cy_remap(). Returns ErrArgument for an empty/invalid
+// `from` and ErrName for an invalid `to`. The caller need not hold c.mu.
+func (c *Cy) Remap(from, to string) error {
+	fromNorm, ok := normalizeName(from)
+	if !ok || fromNorm == "" {
+		return ErrArgument
 	}
-
-	// Apply remapping
-	if remapped, ok := c.remap[name]; ok {
-		name = remapped
+	// Validate `to`: it is stored verbatim, but its pin-free, normalized form must
+	// be non-empty, and a pinned `to` must be verbatim (no substitution tokens).
+	toUnpinned, toPin := nameConsumePinSuffix(to)
+	toNorm, ok := normalizeName(toUnpinned)
+	if !ok || toNorm == "" {
+		return ErrName
 	}
-
-	return name
+	if toPin <= SubjectIDPinnedMax && !nameIsVerbatim(toUnpinned) {
+		return ErrName
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remap == nil {
+		c.remap = make(map[string]string)
+	}
+	c.remap[fromNorm] = to
+	return nil
 }
 
-// findOrCreateTopic finds a topic by name or creates it if it doesn't exist.
-// extent is the maximum message size for the topic (per subscription) and is applied
-// before the platform reader is created. The topic's subject-ID is then allocated
-// (and possibly re-allocated on collision) by topicAllocate. The caller must hold
-// c.mu.
+// Unremap removes a previously installed remap rule, applying the same
+// normalization to `from` as Remap(). It is a no-op if the key is absent and
+// returns ErrArgument for an empty/invalid `from`. It mirrors C cy_unremap().
+func (c *Cy) Unremap(from string) error {
+	fromNorm, ok := normalizeName(from)
+	if !ok || fromNorm == "" {
+		return ErrArgument
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remap != nil {
+		delete(c.remap, fromNorm)
+	}
+	return nil
+}
+
+// findOrCreateTopic resolves the supplied user name and finds or creates the
+// corresponding topic. The topic's subject-ID is allocated (and possibly
+// re-allocated on collision) by topicAllocate. It mirrors C cy_find_topic_or_create(),
+// which resolves the name before lookup/creation. The caller must hold c.mu.
 func (c *Cy) findOrCreateTopic(name string, extent int) (*Topic, error) {
+	resolved := c.Resolve(name)
+	if !resolved.Ok {
+		return nil, ErrName
+	}
+	return c.findOrCreateTopicResolved(resolved, extent)
+}
+
+// findOrCreateTopicResolved is findOrCreateTopic for an already-resolved name.
+// The caller must hold c.mu.
+func (c *Cy) findOrCreateTopicResolved(resolved Resolved, extent int) (*Topic, error) {
+	name := resolved.Name
 	// Check if the topic already exists
 	if topic, ok := c.topicsByName[name]; ok {
 		return topic, nil
 	}
 	// Create a new topic
-	topic, err := newTopic(name, c.subjectIDModulus)
+	topic, err := newTopic(name, c.subjectIDModulus, resolved.Pin)
 	if err != nil {
 		return nil, err
 	}
@@ -749,11 +829,16 @@ func (c *Cy) FindTopicByHash(hash uint64) *Topic {
 	return c.topicsByHash[hash]
 }
 
-// FindTopic finds a topic by its name.
+// FindTopic finds a topic by its name. The name is resolved (namespace,
+// remapping, pin) before lookup, mirroring C cy_topic_find_by_name().
 func (c *Cy) FindTopic(name string) *Topic {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.topicsByName[name]
+	resolved := c.Resolve(name)
+	if !resolved.Ok {
+		return nil
+	}
+	return c.topicsByName[resolved.Name]
 }
 
 // FindOrCreateTopic finds a topic by name or creates it if it does not exist.

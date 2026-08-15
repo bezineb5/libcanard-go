@@ -51,39 +51,43 @@ type Topic struct {
 	refcount int
 }
 
-// newTopic creates a new topic with the specified name.
-func newTopic(name string, modulus uint32) (*Topic, error) {
+// newTopic creates a new topic with the specified name. The name is expected to be
+// pin-free (resolution strips any pin); the explicit pin argument (PinNone for a
+// non-pinned topic, or a value <= SubjectIDPinnedMax) selects the pinned subject-ID.
+// It mirrors C topic_new(), which receives an already-resolved name and eviction state.
+func newTopic(name string, modulus uint32, pin uint16) (*Topic, error) {
 	if name == "" {
 		return nil, ErrName
 	}
 
-	// Normalize the name
-	name = NormalizeTopicName(name)
+	// Normalize and charset-validate the name.
+	name, ok := normalizeName(name)
+	if !ok {
+		return nil, ErrName
+	}
 
 	// Compute hash
 	hash := HashString(name)
 
-	// Check if this is a pinned topic
-	pinned, pinnedSubjectID := ParsePinnedTopic(name)
-
 	topic := &Topic{
-		name:    name,
-		hash:    hash,
-		pinned:  pinned,
+		name:     name,
+		hash:     hash,
 		tsOrigin: 0,
-		logAge:  LAGEMin,
-		extent: 0,
+		logAge:   LAGEMin,
+		extent:   0,
 		refcount: 1,
 	}
 
-	// Assign subject-ID and the pinned eviction encoding. Pinned topics encode
-	// the subject-ID in the eviction counter as UINT32_MAX - subject_id, placing
-	// it in the reserved pinned range [EVICTIONS_PINNED_MIN, UINT32_MAX]; this is
-	// what lets is_pinned() detect them and keeps the hash reflecting the name.
-	if pinned {
-		topic.subjectID = pinnedSubjectID
-		topic.pinnedSubjectID = pinnedSubjectID
-		topic.evictions = ^pinnedSubjectID
+	// Pinned topics encode the subject-ID in the eviction counter as
+	// UINT32_MAX - subject_id, placing it in the reserved pinned range
+	// [EVICTIONS_PINNED_MIN, UINT32_MAX]; this is what lets is_pinned() detect them
+	// and keeps the hash reflecting the name. findOrCreateTopic re-syncs evictions
+	// from the CRDT afterwards (pinned topics keep this encoding).
+	if pin <= SubjectIDPinnedMax {
+		topic.pinned = true
+		topic.pinnedSubjectID = uint32(pin)
+		topic.subjectID = uint32(pin)
+		topic.evictions = ^uint32(pin)
 	} else {
 		topic.subjectID = ComputeSubjectID(hash, 0, modulus)
 	}
@@ -91,9 +95,10 @@ func newTopic(name string, modulus uint32) (*Topic, error) {
 	return topic, nil
 }
 
-
 // ParsePinnedTopic checks if a topic name has a pinned subject-ID.
 // Pinned topics have the format "name#1234" where 1234 is the subject-ID.
+// NOTE: Prefer resolving names via Cy.Resolve/Cy.Resolve, which strips and reports
+// the pin explicitly; this helper remains for direct name inspection.
 func ParsePinnedTopic(name string) (bool, uint32) {
 	// Find the last '#' in the name
 	idx := strings.LastIndex(name, "#")
