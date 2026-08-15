@@ -436,18 +436,25 @@ func (f *RequestFuture) MoveResponse() *Response {
 
 	return &response
 }
-// Destroy destroys the request future. If it carried a reliable-response dedup record that
-// acked anything, the record is handed off to the RPC so retransmitted reliable responses keep
-// getting answered after the application is gone (faithful to C request_future_dispose).
+// Destroy destroys the request future. Faithful to C request_future_dispose: the future is
+// de-indexed from the RPC at dispose (so post-destroy retransmits are answered by the handed-off
+// record, never re-delivered into a dead future), and any reliable-response dedup record that
+// acked something is retained so retransmitted reliable responses keep getting answered.
 func (f *RequestFuture) Destroy() {
 	f.responseMu.Lock()
 	ack := f.ack
 	f.responses = nil
 	f.responseMu.Unlock()
 
-	if ack != nil && f.rpc != nil && (ack.solo || ack.tree != nil) {
+	if f.rpc != nil {
 		f.rpc.mu.Lock()
-		f.rpc.retainRequestAck(ack, f.rpc.cy.Now())
+		// De-index at dispose (C future_index_remove). Release responseMu first to avoid a
+		// lock-order inversion with handleResponseCorrelation (which holds r.mu then responseMu).
+		delete(f.rpc.requests, f.tag)
+		if ack != nil && (ack.solo || ack.tree != nil) {
+			f.rpc.retainRequestAck(ack, f.rpc.cy.Now())
+		}
+		f.ack = nil
 		f.rpc.mu.Unlock()
 	}
 

@@ -119,10 +119,13 @@ func TestRequesterReliableDedupRetransmit(t *testing.T) {
 		t.Fatalf("phase B: expected 1 delivered response, got %d", fut2.ResponseCount())
 	}
 	fut2.Destroy()
-	// Retransmit seqno 0 after destroy: within history -> still ACKed (retained solo record),
-	// application sees nothing further because the future is gone.
+	// Retransmit seqno 0 after destroy: within history -> still ACKed from the retained record,
+	// AND the (now de-indexed) future must NOT be re-delivered into. Count stays 1.
 	if typ := ackType(deliver(fut2, 0)); typ != cy.HeaderTypeRspAck {
 		t.Fatalf("post-destroy in-history retransmit should still be ACKed, got type %d", typ)
+	}
+	if fut2.ResponseCount() != 1 {
+		t.Fatalf("post-destroy retransmit must not be re-delivered into a dead future; got %d", fut2.ResponseCount())
 	}
 }
 
