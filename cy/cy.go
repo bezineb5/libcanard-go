@@ -343,9 +343,11 @@ func (c *Cy) Spin(deadline Microsecond) error {
 // SpinUntil runs the event loop until the specified deadline.
 // It processes incoming messages and executes scheduled tasks.
 func (c *Cy) SpinUntil(deadline Microsecond) error {
-	// Process scheduled tasks
+	// Process scheduled tasks whose deadlines are already due. The olga
+	// scheduler reports worst-lateness via SpinUntil's result, but (faithful to
+	// the C reference) the cy layer surfaces lag errors at the per-message
+	// future level rather than from the scheduler's aggregate.
 	c.olga.RunUntil(int64(deadline))
-	// olga.RunUntil doesn't return an error currently
 
 	// Retry any scouts that failed to emit when their pattern subscription was created.
 	c.sendPendingScouts()

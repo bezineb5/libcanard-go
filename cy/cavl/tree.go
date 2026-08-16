@@ -310,7 +310,7 @@ func (t *Tree[K, V]) deleteRecursive(n *Node[K, V], key K) (*Node[K, V], *Node[K
 
 // findMin finds the node with the minimum key in a subtree.
 func (t *Tree[K, V]) findMin(n *Node[K, V]) *Node[K, V] {
-	for n.left != nil {
+	for n != nil && n.left != nil {
 		n = n.left
 	}
 	return n
@@ -487,7 +487,7 @@ func (t *Tree[K, V]) Last() *Node[K, V] {
 
 // findMax finds the node with the maximum key in a subtree.
 func (t *Tree[K, V]) findMax(n *Node[K, V]) *Node[K, V] {
-	for n.right != nil {
+	for n != nil && n.right != nil {
 		n = n.right
 	}
 	return n

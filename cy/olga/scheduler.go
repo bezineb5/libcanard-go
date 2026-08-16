@@ -1,380 +1,430 @@
-// Package olga provides an event loop scheduler with O(1) insertion and removal.
-// This is a Go port of the olga_scheduler.h C library used by the cy library.
+// Package olga provides an EDF (earliest-deadline-first) scheduler.
 //
-// Olga (O(1) Logarithmic-Gap Aware scheduler) is a simple event loop scheduler that
-// maintains a set of timed callbacks and invokes them when their deadlines are reached.
-// It uses a linked list of time-ordered tasks to achieve O(1) insertion and removal
-// for most operations.
+// This is a faithful port of the C reference olga_scheduler.h (cavl2-based
+// balanced binary search tree keyed by (deadline, seqno)). Insertion and removal
+// are O(log n); ties on the deadline are broken by a monotonically increasing
+// sequence number so that tasks scheduled at the same deadline are invoked in
+// FIFO order (first scheduled, first served). A spin reports the next pending
+// deadline, the worst (maximum) lateness observed while running due tasks, and
+// the freshly sampled time -- this mirrors olga_spin_result_t.
 package olga
 
 import (
-	"container/list"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/opencyphal/cy-go/cavl"
 )
 
+// maxInt64 is the "no deadline" sentinel used for NextDeadline when the queue
+// is empty, mirroring the C constant INT64_MAX.
+const maxInt64 = int64(^uint64(0) >> 1)
+
+// taskKey is the search key for the scheduler tree. It is (deadline, seqno):
+// the deadline is the primary ordering key (earliest deadline first) and the
+// sequence number provides a stable FIFO tie-break for equal deadlines. The
+// sequence number is unique per insertion so every key is distinct.
+type taskKey struct {
+	deadline int64
+	seqno    uint64
+}
+
+// compareTaskKey mirrors C olga_scheduler.h's comparator: order primarily by
+// deadline, then by sequence number for a deterministic FIFO tie-break.
+func compareTaskKey(a, b taskKey) int {
+	if a.deadline != b.deadline {
+		if a.deadline > b.deadline {
+			return 1
+		}
+		return -1
+	}
+	if a.seqno != b.seqno {
+		if a.seqno > b.seqno {
+			return 1
+		}
+		return -1
+	}
+	return 0
+}
+
 // Task represents a scheduled task with a deadline and callback.
+//
+// Active reflects whether the task is currently pending in the scheduler. It is
+// managed by Schedule/Cancel/Reschedule and after a task is executed; external
+// code should treat it as read-only.
 type Task struct {
-	// Deadline is the absolute time (in microseconds) when the task should be executed.
 	Deadline int64
-	// Callback is the function to call when the deadline is reached.
+	Seqno    uint64
 	Callback func()
-	// Active indicates whether the task is currently scheduled.
+	// Active is true while the task is enqueued and pending execution.
 	Active bool
-	// element is the list element for the task in the scheduler's list.
-	element *list.Element
-	// nextDeadline is used for quick access to the next task's deadline.
-	nextDeadline int64
+
+	// key is the (deadline, seqno) key currently used to locate the task in the
+	// tree. It is meaningful only while Active is true.
+	key taskKey
 }
 
-// Scheduler is an event loop scheduler that maintains a set of timed callbacks.
+// SpinResult is the outcome of a spin, faithful to C olga_spin_result_t.
+type SpinResult struct {
+	// NextDeadline is the deadline of the earliest still-pending task, or
+	// maxInt64 if the queue is empty.
+	NextDeadline int64
+	// WorstLateness is the maximum of (now - deadline) across all tasks executed
+	// during the spin; it is negative or zero when every task ran on time.
+	WorstLateness int64
+	// Now is the clock value sampled at the end of the spin.
+	Now int64
+}
+
+// Scheduler is an EDF scheduler backed by a balanced AVL tree.
+//
+// All methods are safe for concurrent use. The clock is supplied via NowFunc;
+// it is expected to return microseconds (the OpenCyphal convention).
 type Scheduler struct {
-	mu       sync.Mutex
-	tasks    list.List // Sorted list of tasks by deadline
-	stop     chan struct{}
-	running  atomic.Bool
-	wakeup   chan struct{}
-	nowFunc  func() int64 // Function to get current time in microseconds
-	stopped  chan struct{}
+	mu        sync.Mutex
+	tree      *cavl.Tree[taskKey, *Task]
+	nextSeqno uint64
+	nowFunc   func() int64
+	user      interface{}
+
+	stop    chan struct{}
+	wakeup  chan struct{}
+	running atomic.Bool
+	stopped chan struct{}
 }
 
-// New creates a new scheduler with the default time function.
+// defaultNowFunc is a placeholder clock that returns a fixed instant. It is
+// replaced by SetNowFunc before any real use (the cy library always does so).
+func defaultNowFunc() int64 { return 0 }
+
+// New creates a new scheduler with a placeholder clock. Use SetNowFunc to
+// install a real clock before scheduling tasks.
 func New() *Scheduler {
-	return &Scheduler{
-		tasks:   list.List{},
+	s := &Scheduler{
+		tree:    cavl.New[taskKey, *Task](compareTaskKey),
 		stop:    make(chan struct{}),
 		wakeup:  make(chan struct{}, 1),
 		stopped: make(chan struct{}),
 		nowFunc: defaultNowFunc,
 	}
+	return s
 }
 
-// NewWithNowFunc creates a new scheduler with a custom time function.
+// NewWithNowFunc creates a new scheduler with the given clock function.
 func NewWithNowFunc(nowFunc func() int64) *Scheduler {
 	s := New()
 	s.nowFunc = nowFunc
 	return s
 }
 
-// defaultNowFunc returns the current time in microseconds.
-// This is a placeholder - real implementations should use the platform's time source.
-func defaultNowFunc() int64 {
-	// In a real implementation, this would use time.Now().UnixMicro()
-	// or the platform's time source
-	return 0
-}
-
-// Now returns the current time according to the scheduler's time function.
+// Now returns the current clock value.
 func (s *Scheduler) Now() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.nowFunc()
 }
 
-// SetNowFunc sets the time function for the scheduler.
+// SetNowFunc installs the clock function used to determine task due-ness.
 func (s *Scheduler) SetNowFunc(nowFunc func() int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nowFunc = nowFunc
+	if nowFunc != nil {
+		s.nowFunc = nowFunc
+	}
 }
 
-// Schedule adds a new task to be executed at the specified deadline.
-// The deadline is an absolute time in microseconds.
-// Returns the task, which can be used to cancel it later.
+// Schedule enqueues a task to run at the given deadline. It returns a handle
+// that can later be passed to Cancel or Reschedule. Tasks scheduled at the same
+// deadline execute in FIFO order.
 func (s *Scheduler) Schedule(deadline int64, callback func()) *Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	k := taskKey{deadline: deadline, seqno: s.nextSeqno}
+	s.nextSeqno++
 	task := &Task{
-		Deadline:   deadline,
-		Callback:   callback,
-		Active:     true,
-		nextDeadline: deadline,
+		Deadline: deadline,
+		Seqno:    k.seqno,
+		Callback: callback,
+		Active:   true,
+		key:      k,
 	}
+	s.tree.Insert(k, task)
+	s.wakeupIfEarliest(k)
+	return task
+}
 
-	// Insert the task in sorted order
-	task.element = s.insertSorted(task)
-
-	// If this is the earliest task, wake up the event loop
-	if task.element == s.tasks.Front() {
+// wakeupIfEarliest signals the Run loop if the given key is now the earliest
+// pending task. Caller must hold s.mu.
+func (s *Scheduler) wakeupIfEarliest(k taskKey) {
+	node := s.tree.First()
+	if node != nil && node.Key == k {
 		select {
 		case s.wakeup <- struct{}{}:
 		default:
 		}
 	}
-
-	return task
 }
 
-// insertSorted inserts a task into the sorted list and returns its element.
-func (s *Scheduler) insertSorted(task *Task) *list.Element {
-	// Find the insertion point
-	var insertBefore *list.Element
-	for e := s.tasks.Front(); e != nil; e = e.Next() {
-		other := e.Value.(*Task)
-		if other.Deadline > task.Deadline {
-			insertBefore = e
-			break
-		}
-	}
-
-	if insertBefore != nil {
-		return s.tasks.InsertBefore(task, insertBefore)
-	}
-	return s.tasks.PushBack(task)
-}
-
-// Cancel removes a task from the scheduler.
-// The task's callback will not be invoked.
+// Cancel removes a task from the scheduler. Calling it on an already-completed or
+// canceled task is a safe no-op (mirrors olga_cancel). The task's Active flag is
+// cleared.
 func (s *Scheduler) Cancel(task *Task) {
-	if task == nil || !task.Active {
+	if task == nil {
 		return
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Remove by the stored key. If the task is not pending this is a harmless
+	// no-op (cavl Delete on a missing key does nothing).
+	s.tree.Delete(task.key)
+	task.Active = false
+	task.key = taskKey{}
+}
 
+// Reschedule changes the deadline of a currently pending task, faithful to
+// C olga_defer on an existing event: the old entry is removed and a fresh
+// (deadline, seqno) key is inserted, preserving FIFO ordering among equal
+// deadlines. It is a no-op if the task is not active.
+func (s *Scheduler) Reschedule(task *Task, newDeadline int64) {
+	if task == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !task.Active {
 		return
 	}
-
-	task.Active = false
-	s.tasks.Remove(task.element)
-	task.element = nil
+	s.tree.Delete(task.key)
+	k := taskKey{deadline: newDeadline, seqno: s.nextSeqno}
+	s.nextSeqno++
+	task.Deadline = newDeadline
+	task.Seqno = k.seqno
+	task.key = k
+	s.tree.Insert(k, task)
+	s.wakeupIfEarliest(k)
 }
 
-// Run starts the event loop.
-// It blocks until Stop is called.
-func (s *Scheduler) Run() {
+// spin runs tasks in earliest-deadline order and reports the spin outcome.
+// When checkNow is true (faithful to C olga_spin), only tasks whose deadline is
+// at or before the sampled clock are executed; otherwise (the legacy RunUntil
+// path used by the cy library) tasks are run up to the deadline bound regardless
+// of the clock, which the cy test suite and timing model rely upon. Callbacks are
+// invoked without holding s.mu to avoid re-entrant deadlocks. The task is removed
+// from the tree before the callback, but its Active flag and key are left intact
+// so a callback may safely Reschedule/Cancel it (matching the prior behavior).
+func (s *Scheduler) spin(limit int64, checkNow bool) SpinResult {
+	var res SpinResult
+	res.NextDeadline = maxInt64
+	worst := int64(0)
+
+	for {
+		s.mu.Lock()
+		node := s.tree.First()
+		if node == nil {
+			s.mu.Unlock()
+			break
+		}
+		task := node.Value
+		now := s.nowFunc()
+		if (checkNow && task.Deadline > now) || task.Deadline > limit {
+			res.NextDeadline = task.Deadline
+			res.Now = now
+			s.mu.Unlock()
+			break
+		}
+		// Dequeue before releasing the lock so a concurrent Cancel/Reschedule
+		// cannot mutate this task while it is still pending.
+		s.tree.Delete(task.key)
+		lateness := now - task.Deadline
+		if lateness > worst {
+			worst = lateness
+		}
+		res.Now = now
+		s.mu.Unlock()
+
+		if task.Callback != nil {
+			task.Callback()
+		}
+	}
+	res.WorstLateness = worst
+	return res
+}
+
+// Run starts the scheduler loop, blocking until Stop is called. It fires due
+// tasks and sleeps until the next deadline otherwise, faithfully mirroring a
+// blocking event loop. It is not used by the cy library, which drives the
+// scheduler explicitly via SpinUntil; it is provided for standalone use and
+// tests.
+func (s *Scheduler) Run() error {
 	if !s.running.CompareAndSwap(false, true) {
-		return // Already running
+		return nil
 	}
 	defer s.running.Store(false)
 	defer close(s.stopped)
 
 	for {
+		s.mu.Lock()
+		now := s.nowFunc()
+		next := maxInt64
+		if node := s.tree.First(); node != nil {
+			next = node.Value.Deadline
+		}
+		s.mu.Unlock()
+
 		select {
 		case <-s.stop:
-			return
+			return nil
 		case <-s.wakeup:
-			// Drain the wakeup channel
-			for {
-				select {
-				case <-s.wakeup:
-				default:
-					goto processTasks
-				}
-			}
-		processTasks:
+			s.processTasks()
+		case <-s.sleepTimer(now, next):
 			s.processTasks()
 		}
 	}
 }
 
-// RunUntil runs the event loop until the specified deadline.
-// It processes all tasks with deadlines <= deadline.
-// It returns the error from the last task executed, or nil if no error occurred.
-func (s *Scheduler) RunUntil(deadline int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// maxSleepMicros bounds a single sleep so that converting microseconds to
+// nanoseconds cannot overflow time.Duration (which is an int64 of nanoseconds).
+const maxSleepMicros = int64(1) << 52 // ~4.5e12 us (< 2^63/1e6 ns)
 
-	// Process all tasks with deadline <= deadline
-	count := 0
-	for s.tasks.Len() > 0 {
-		front := s.tasks.Front()
-		if front == nil {
-			break
-		}
-
-		task := front.Value.(*Task)
-		if task.Deadline > deadline {
-			break
-		}
-
-		// Remove the task from the list
-		s.tasks.Remove(front)
-		task.element = nil
-		count++
-
-		// Call the callback (outside the lock to avoid deadlocks)
-		s.mu.Unlock()
-		if task.Active {
-			task.Active = false
-			task.Callback()
-		}
-		s.mu.Lock()
+// sleepTimer returns a channel that fires after the shorter of (next-now)
+// microseconds and maxSleepMicros, or a never-firing channel if next <= now.
+func (s *Scheduler) sleepTimer(now, next int64) <-chan time.Time {
+	if next <= now {
+		return make(chan time.Time) // never fires
 	}
+	d := next - now
+	if d > maxSleepMicros {
+		d = maxSleepMicros
+	}
+	return time.After(time.Duration(d) * time.Microsecond)
+}
 
+// RunUntil processes tasks with deadlines at or before the given deadline bound,
+// in earliest-deadline order, WITHOUT requiring the clock to have reached those
+// deadlines. This legacy bound-only semantics is what the cy library and its test
+// suite rely upon (the platform clock may not have advanced to the deadline when
+// RunUntil is invoked). It returns no error; the faithful by-clock spin result is
+// available via SpinUntil.
+func (s *Scheduler) RunUntil(deadline int64) error {
+	s.spin(deadline, false)
 	return nil
 }
 
-// firstDeadline returns the deadline of the first task, or 0 if there are no tasks.
-func (s *Scheduler) firstDeadline() int64 {
-	if s.tasks.Len() == 0 {
-		return 0
-	}
-	return s.tasks.Front().Value.(*Task).Deadline
+// SpinUntil is like RunUntil but additionally only executes tasks whose deadline
+// is at or before the sampled clock, mirroring C olga_spin's deadline check, and
+// returns the spin outcome (including the worst lateness observed).
+func (s *Scheduler) SpinUntil(deadline int64) (SpinResult, error) {
+	return s.spin(deadline, true), nil
 }
 
-// processTasks processes all tasks whose deadlines have been reached.
-func (s *Scheduler) processTasks() {
+// Spin processes all currently-due tasks (deadlines at or before the sampled
+// clock) and returns the spin outcome, mirroring C olga_spin.
+func (s *Scheduler) Spin() (SpinResult, error) {
+	return s.spin(maxInt64, true), nil
+}
+
+// firstDeadline returns the deadline of the earliest pending task, or 0 if the
+// queue is empty.
+func (s *Scheduler) firstDeadline() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if node := s.tree.First(); node != nil {
+		return node.Value.Deadline
+	}
+	return 0
+}
 
+// processTasks runs all currently-due tasks (by clock). It is used by the
+// blocking Run loop; the result is discarded there.
+func (s *Scheduler) processTasks() {
+	s.spin(maxInt64, true)
+}
+
+// waitUntil blocks until the sooner of the given deadline and the earliest
+// pending task deadline (mirroring cy_spin_until's wait clamp). The clock is
+// expected to be in microseconds.
+func (s *Scheduler) waitUntil(deadline int64) {
+	s.mu.Lock()
 	now := s.nowFunc()
+	next := deadline
+	if node := s.tree.First(); node != nil && node.Value.Deadline < next {
+		next = node.Value.Deadline
+	}
+	s.mu.Unlock()
 
-	// Process all tasks with deadline <= now
-	for s.tasks.Len() > 0 {
-		front := s.tasks.Front()
-		if front == nil {
-			break
+	if next > now {
+		d := next - now
+		if d > maxSleepMicros {
+			d = maxSleepMicros
 		}
-
-		task := front.Value.(*Task)
-		if task.Deadline > now {
-			break
-		}
-
-		// Remove the task from the list
-		s.tasks.Remove(front)
-		task.element = nil
-
-		// Release the lock before calling the callback
-		s.mu.Unlock()
-
-		// Call the callback (outside the lock to avoid deadlocks)
-		if task.Active {
-			task.Active = false
-			task.Callback()
-		}
-
-		s.mu.Lock()
+		time.Sleep(time.Duration(d) * time.Microsecond)
 	}
 }
 
-// waitUntil waits until the specified deadline.
-func (s *Scheduler) waitUntil(deadline int64) {
-	// Simple implementation - in a real scheduler, this would use
-	// time.Sleep or a more sophisticated waiting mechanism
-	// For now, we just return immediately
-}
-
-// Stop stops the event loop.
+// Stop terminates the scheduler loop started by Run and waits for it to exit.
 func (s *Scheduler) Stop() {
 	if s.running.CompareAndSwap(true, false) {
 		close(s.stop)
-		<-s.stopped // Wait for Run to return
+		<-s.stopped
 	}
 }
 
-// Len returns the number of scheduled tasks.
+// Len returns the number of pending tasks.
 func (s *Scheduler) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.tasks.Len()
+	return s.tree.Len()
 }
 
-// Empty returns true if there are no scheduled tasks.
+// Empty reports whether there are no pending tasks.
 func (s *Scheduler) Empty() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.tasks.Len() == 0
+	return s.tree.Empty()
 }
 
-// NextDeadline returns the deadline of the next task to be executed,
-// or 0 if there are no tasks.
+// NextDeadline returns the deadline of the earliest pending task, or 0 if the
+// queue is empty.
 func (s *Scheduler) NextDeadline() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.firstDeadline()
 }
 
-// Clear removes all scheduled tasks.
+// Clear removes all pending tasks without invoking any of them.
 func (s *Scheduler) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks.Init()
-}
-
-// Reschedule updates the deadline of a scheduled task.
-// The task must be active (not yet executed or canceled).
-func (s *Scheduler) Reschedule(task *Task, newDeadline int64) {
-	if task == nil {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// If the task is in the list, remove it first
-	if task.element != nil {
-		s.tasks.Remove(task.element)
-		task.element = nil
-	}
-
-	// Update the deadline
-	task.Deadline = newDeadline
-	task.nextDeadline = newDeadline
-	// Reactivate the task
-	task.Active = true
-
-	// Reinsert in sorted order
-	task.element = s.insertSorted(task)
-
-	// If this is now the earliest task, wake up the event loop
-	if task.element == s.tasks.Front() {
-		select {
-		case s.wakeup <- struct{}{}:
-		default:
-		}
+	for node := s.tree.First(); node != nil; node = s.tree.First() {
+		task := node.Value
+		s.tree.Delete(task.key)
+		task.Active = false
+		task.key = taskKey{}
 	}
 }
 
-// RunOnce runs the event loop once, executing all tasks whose deadlines have been reached.
-// Returns the number of tasks executed.
+// RunOnce runs at most one currently-due task and returns the number of tasks
+// executed (0 or 1).
 func (s *Scheduler) RunOnce() int {
 	s.mu.Lock()
-	count := s.runOnceLocked()
-	s.mu.Unlock()
-	return count
-}
-
-// runOnceLocked executes one task whose deadline has been reached.
-// Must be called with the mutex held.
-func (s *Scheduler) runOnceLocked() int {
-	now := s.nowFunc()
-
-	// Find the first task with deadline <= now
-	for s.tasks.Len() > 0 {
-		front := s.tasks.Front()
-		if front == nil {
-			break
-		}
-
-		task := front.Value.(*Task)
-		if task.Deadline > now {
-			return 0
-		}
-
-		// Remove the task from the list
-		s.tasks.Remove(front)
-		task.element = nil
-		
-		// Keep task active until callback completes (in case it reschedules itself)
-		wasActive := task.Active
-		
-		// Release the lock temporarily to call the callback
+	node := s.tree.First()
+	if node == nil {
 		s.mu.Unlock()
-
-		count := 0
-		if wasActive {
-			task.Callback()
-			count = 1
-			// Don't mark as inactive - let Reschedule manage the Active flag
-			// If the task wasn't rescheduled, it will remain active but won't be in the list
-		}
-
-		s.mu.Lock()
-		return count
+		return 0
 	}
+	task := node.Value
+	now := s.nowFunc()
+	if task.Deadline > now {
+		s.mu.Unlock()
+		return 0
+	}
+	// Dequeue before releasing the lock; leave Active/key intact so a callback
+	// may Reschedule this task (matching prior behavior).
+	s.tree.Delete(task.key)
+	s.mu.Unlock()
 
-	return 0
+	if task.Callback != nil {
+		task.Callback()
+	}
+	return 1
 }
