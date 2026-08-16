@@ -14,16 +14,16 @@ import (
 type SimNode struct {
 	// ID is the unique identifier for this node.
 	ID uint64
-	
+
 	// Cy is the Cy instance for this node.
 	Cy *cy.Cy
-	
+
 	// Platform is the mock platform for this node.
 	Platform *SimPlatform
-	
+
 	// Name is the node name.
 	Name string
-	
+
 	// mu protects the node state.
 	mu sync.RWMutex
 }
@@ -32,16 +32,16 @@ type SimNode struct {
 type SimNetwork struct {
 	// nodes is the list of nodes in the network.
 	nodes []*SimNode
-	
+
 	// messages is a queue of messages to be delivered.
 	messages []SimMessage
-	
+
 	// mu protects the network state.
 	mu sync.RWMutex
-	
+
 	// now is the current simulation time.
 	now cy.Microsecond
-	
+
 	// randomState is the PRNG state.
 	randomState uint64
 }
@@ -66,16 +66,16 @@ type SimMessage struct {
 type SimPlatform struct {
 	// node is the node this platform belongs to.
 	node *SimNode
-	
+
 	// network is the simulation network.
 	network *SimNetwork
-	
+
 	// writers maps subject-IDs to subject writers.
 	writers map[uint32]*SimSubjectWriter
-	
+
 	// readers maps subject-IDs to subject readers.
 	readers map[uint32]*SimSubjectReader
-	
+
 	// mu protects the platform state.
 	mu sync.RWMutex
 }
@@ -89,7 +89,7 @@ type SimSubjectWriter struct {
 // SimSubjectReader implements cy.SubjectReader for the simulation network.
 type SimSubjectReader struct {
 	subjectID uint32
-	extent   int
+	extent    int
 	platform  *SimPlatform
 }
 
@@ -98,10 +98,10 @@ func NewSimNetwork(nodeCount int) *SimNetwork {
 	network := &SimNetwork{
 		nodes:       make([]*SimNode, nodeCount),
 		messages:    make([]SimMessage, 0),
-		now:        0,
+		now:         0,
 		randomState: 0x1020304050607080,
 	}
-	
+
 	// Create nodes
 	for i := 0; i < nodeCount; i++ {
 		name := "node" + string(rune('a'+i))
@@ -109,28 +109,28 @@ func NewSimNetwork(nodeCount int) *SimNetwork {
 			writers: make(map[uint32]*SimSubjectWriter),
 			readers: make(map[uint32]*SimSubjectReader),
 		}
-		
+
 		node := &SimNode{
 			ID:       uint64(i + 1),
 			Name:     name,
 			Platform: platform,
 		}
-		
+
 		platform.node = node
 		platform.network = network
-		
+
 		// Create Cy instance
 		cyInstance, err := cy.New(platform, name, "", "")
 		if err != nil {
 			panic(err)
 		}
-		
+
 		node.Cy = cyInstance
 		platform.node.Cy = cyInstance
-		
+
 		network.nodes[i] = node
 	}
-	
+
 	return network
 }
 
@@ -138,7 +138,7 @@ func NewSimNetwork(nodeCount int) *SimNetwork {
 func (p *SimPlatform) NewSubjectWriter(subjectID uint32) (cy.SubjectWriter, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	writer := &SimSubjectWriter{
 		subjectID: subjectID,
 		platform:  p,
@@ -151,7 +151,7 @@ func (p *SimPlatform) NewSubjectWriter(subjectID uint32) (cy.SubjectWriter, erro
 func (p *SimPlatform) DestroySubjectWriter(writer cy.SubjectWriter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if sw, ok := writer.(*SimSubjectWriter); ok {
 		delete(p.writers, sw.subjectID)
 	}
@@ -166,17 +166,17 @@ func (w *SimSubjectWriter) SubjectID() uint32 {
 func (p *SimPlatform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Microsecond, priority cy.Priority, data []byte) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	if p.node == nil || p.network == nil {
 		return cy.ErrArgument
 	}
-	
+
 	// Get the subject-ID from the writer
 	sw, ok := writer.(*SimSubjectWriter)
 	if !ok {
 		return cy.ErrArgument
 	}
-	
+
 	// Create a message and add it to the network queue
 	message := SimMessage{
 		From:      p.node.ID,
@@ -186,11 +186,11 @@ func (p *SimPlatform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Mic
 		Timestamp: p.network.Now(),
 		Priority:  priority,
 	}
-	
+
 	p.network.mu.Lock()
 	p.network.messages = append(p.network.messages, message)
 	p.network.mu.Unlock()
-	
+
 	return nil
 }
 
@@ -198,10 +198,10 @@ func (p *SimPlatform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Mic
 func (p *SimPlatform) NewSubjectReader(subjectID uint32, extent int) (cy.SubjectReader, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	reader := &SimSubjectReader{
 		subjectID: subjectID,
-		extent:   extent,
+		extent:    extent,
 		platform:  p,
 	}
 	p.readers[subjectID] = reader
@@ -212,7 +212,7 @@ func (p *SimPlatform) NewSubjectReader(subjectID uint32, extent int) (cy.Subject
 func (p *SimPlatform) DestroySubjectReader(reader cy.SubjectReader) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if sr, ok := reader.(*SimSubjectReader); ok {
 		delete(p.readers, sr.subjectID)
 	}
@@ -222,7 +222,7 @@ func (p *SimPlatform) DestroySubjectReader(reader cy.SubjectReader) {
 func (p *SimPlatform) SetSubjectReaderExtent(reader cy.SubjectReader, extent int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if sr, ok := reader.(*SimSubjectReader); ok {
 		sr.extent = extent
 	}
@@ -232,11 +232,11 @@ func (p *SimPlatform) SetSubjectReaderExtent(reader cy.SubjectReader, extent int
 func (p *SimPlatform) Unicast(lane cy.Lane, deadline cy.Microsecond, data []byte) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	if p.node == nil || p.network == nil {
 		return cy.ErrArgument
 	}
-	
+
 	// Create a unicast message
 	message := SimMessage{
 		From:      p.node.ID,
@@ -246,11 +246,11 @@ func (p *SimPlatform) Unicast(lane cy.Lane, deadline cy.Microsecond, data []byte
 		Timestamp: p.network.Now(),
 		Priority:  lane.Priority,
 	}
-	
+
 	p.network.mu.Lock()
 	p.network.messages = append(p.network.messages, message)
 	p.network.mu.Unlock()
-	
+
 	return nil
 }
 
@@ -266,27 +266,25 @@ func (p *SimPlatform) SetUnicastExtent(extent int) {
 func (p *SimPlatform) Spin(deadline cy.Microsecond) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	if p.node == nil || p.network == nil {
 		return cy.ErrArgument
 	}
-	
-	// Process messages in the network queue
+
+	// Faithful to C platform->spin(deadline): advance the local clock to the
+	// deadline so that time flows to it. The simulation clock cannot wait in real
+	// time, so advancing it here is the equivalent of C's blocking wait.
 	p.network.mu.Lock()
-	defer p.network.mu.Unlock()
-	
-	for len(p.network.messages) > 0 {
-		msg := p.network.messages[0]
-		p.network.messages = p.network.messages[1:]
-		
-		// Deliver to the appropriate node
-		if msg.To == 0 || msg.To == p.node.ID {
-			// This message is for us (multicast or unicast to us)
-			// In a real implementation, we'd deliver to the Cy instance
-			// For now, just acknowledge receipt
-		}
+	if deadline > p.network.now {
+		p.network.now = deadline
 	}
-	
+	// Process messages in the network queue (delivery itself is performed by the
+	// test harness via ProcessMessages; here we just drain what remains).
+	for len(p.network.messages) > 0 {
+		p.network.messages = p.network.messages[1:]
+	}
+	p.network.mu.Unlock()
+
 	return nil
 }
 
@@ -301,7 +299,7 @@ func (p *SimPlatform) SubjectIDModulus() uint32 {
 func (p *SimPlatform) Now() cy.Microsecond {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	if p.network != nil {
 		p.network.mu.RLock()
 		defer p.network.mu.RUnlock()
@@ -326,7 +324,7 @@ func (p *SimPlatform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 func (p *SimPlatform) Random() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.network != nil {
 		p.network.mu.Lock()
 		p.network.randomState++
@@ -334,7 +332,7 @@ func (p *SimPlatform) Random() uint64 {
 		p.network.mu.Unlock()
 		return rand
 	}
-	
+
 	return 0
 }
 
@@ -363,7 +361,7 @@ func (n *SimNetwork) Advance(delta cy.Microsecond) {
 func (n *SimNetwork) GetNode(index int) *SimNode {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	
+
 	if index < 0 || index >= len(n.nodes) {
 		return nil
 	}
@@ -409,13 +407,13 @@ func (n *SimNetwork) deliverToNode(node *SimNode, msg SimMessage) {
 	// Create a MessageTS
 	message := cy.NewMessage(msg.Data)
 	messageTS := cy.NewMessageTS(msg.Timestamp, message)
-	
+
 	// Create a Lane
 	lane := cy.Lane{
 		ID:       msg.From,
 		Priority: msg.Priority,
 	}
-	
+
 	// Deliver to the Cy instance
 	// This would normally be done by the platform
 	if node.Cy != nil {
@@ -423,7 +421,7 @@ func (n *SimNetwork) deliverToNode(node *SimNode, msg SimMessage) {
 		subjectID := msg.SubjectID
 		node.Cy.HandleMessage(lane, &subjectID, *messageTS)
 	}
-	
+
 	// Clean up
 	message.RefcountDec()
 }

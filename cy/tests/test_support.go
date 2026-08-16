@@ -5,7 +5,6 @@ package tests
 
 import (
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/opencyphal/cy-go"
@@ -16,22 +15,24 @@ import (
 type MockPlatform struct {
 	// cyInstance is the Cy instance (set by cy.New).
 	cyInstance *cy.Cy
-	
+
 	// Messages received by this platform (for testing).
 	ReceivedMessages []ReceivedMessage
-	
+
 	// mu protects the platform state.
 	mu sync.RWMutex
-	
+
 	// closed indicates if the platform has been destroyed.
 	closed bool
-	
-	// nowFunc returns the current time (can be mocked).
-	nowFunc func() cy.Microsecond
-	
+
+	// clock is the monotonic mock clock, advanced by Spin (faithful to C's
+	// blocking platform->spin, which lets time flow to the deadline). Unlike a
+	// real platform it does not track wall-clock time, keeping tests fast.
+	clock cy.Microsecond
+
 	// prngSeed for random number generation.
 	prngSeed uint64
-	
+
 	// unicastExtent is the maximum extent for unicast messages.
 	unicastExtent int
 }
@@ -48,8 +49,7 @@ type ReceivedMessage struct {
 func NewMockPlatform() *MockPlatform {
 	return &MockPlatform{
 		ReceivedMessages: make([]ReceivedMessage, 0),
-		nowFunc:          func() cy.Microsecond { return cy.Microsecond(time.Now().UnixMicro()) },
-		prngSeed:        0xDEADBEEF,
+		prngSeed:         0xDEADBEEF,
 	}
 }
 
@@ -57,11 +57,11 @@ func NewMockPlatform() *MockPlatform {
 func (p *MockPlatform) NewSubjectWriter(subjectID uint32) (cy.SubjectWriter, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return nil, cy.ErrArgument
 	}
-	
+
 	return &mockSubjectWriter{
 		subjectID: subjectID,
 		platform:  p,
@@ -77,11 +77,11 @@ func (p *MockPlatform) DestroySubjectWriter(writer cy.SubjectWriter) {
 func (p *MockPlatform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Microsecond, priority cy.Priority, data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return cy.ErrArgument
 	}
-	
+
 	// For mock, we don't actually send, just record if needed
 	// In a real test, we'd dispatch to subscribers
 	return nil
@@ -91,14 +91,14 @@ func (p *MockPlatform) SubjectWriterSend(writer cy.SubjectWriter, deadline cy.Mi
 func (p *MockPlatform) NewSubjectReader(subjectID uint32, extent int) (cy.SubjectReader, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return nil, cy.ErrArgument
 	}
-	
+
 	return &mockSubjectReader{
 		subjectID: subjectID,
-		extent:   extent,
+		extent:    extent,
 		platform:  p,
 	}, nil
 }
@@ -112,11 +112,11 @@ func (p *MockPlatform) DestroySubjectReader(reader cy.SubjectReader) {
 func (p *MockPlatform) SetSubjectReaderExtent(reader cy.SubjectReader, extent int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return
 	}
-	
+
 	if mr, ok := reader.(*mockSubjectReader); ok {
 		mr.extent = extent
 	}
@@ -126,19 +126,19 @@ func (p *MockPlatform) SetSubjectReaderExtent(reader cy.SubjectReader, extent in
 func (p *MockPlatform) Unicast(lane cy.Lane, deadline cy.Microsecond, data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return cy.ErrArgument
 	}
-	
+
 	// Record the message
 	p.ReceivedMessages = append(p.ReceivedMessages, ReceivedMessage{
 		Lane:      lane,
 		SubjectID: 0, // Not used for unicast
-		Timestamp: p.nowFunc(),
+		Timestamp: p.clock,
 		Data:      append([]byte(nil), data...),
 	})
-	
+
 	return nil
 }
 
@@ -149,16 +149,19 @@ func (p *MockPlatform) SetUnicastExtent(extent int) {
 	p.unicastExtent = extent
 }
 
-// Spin runs the event loop.
+// Spin runs the event loop. Faithful to C platform->spin(deadline), it advances
+// the mock clock to the deadline so that time flows to it, then returns.
 func (p *MockPlatform) Spin(deadline cy.Microsecond) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.closed {
 		return cy.ErrArgument
 	}
-	
-	// For mock, just return OK
+
+	if deadline > p.clock {
+		p.clock = deadline
+	}
 	return cy.OK
 }
 
@@ -173,7 +176,7 @@ func (p *MockPlatform) SubjectIDModulus() uint32 {
 func (p *MockPlatform) Now() cy.Microsecond {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.nowFunc()
+	return p.clock
 }
 
 // Realloc allocates memory.
@@ -226,7 +229,7 @@ func (w *mockSubjectWriter) SubjectID() uint32 {
 // mockSubjectReader implements cy.SubjectReader for testing.
 type mockSubjectReader struct {
 	subjectID uint32
-	extent   int
+	extent    int
 	platform  *MockPlatform
 }
 

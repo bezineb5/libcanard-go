@@ -342,21 +342,26 @@ func (c *Cy) Spin(deadline Microsecond) error {
 
 // SpinUntil runs the event loop until the specified deadline.
 // It processes incoming messages and executes scheduled tasks.
+//
+// This is faithful to C cy_spin_until: drive the platform to the spin deadline
+// (its blocking spin lets time flow to the deadline and pumps pending datagrams),
+// then run all tasks that are now due. olga.Spin runs strictly by the sampled
+// clock, exactly like C's olga_spin (no deadline bound) -- the spin deadline is
+// enforced implicitly because the clock has already advanced to it.
 func (c *Cy) SpinUntil(deadline Microsecond) error {
-	// Process scheduled tasks whose deadlines are already due. The olga
-	// scheduler reports worst-lateness via SpinUntil's result, but (faithful to
-	// the C reference) the cy layer surfaces lag errors at the per-message
-	// future level rather than from the scheduler's aggregate.
-	c.olga.RunUntil(int64(deadline))
-
 	// Retry any scouts that failed to emit when their pattern subscription was created.
 	c.sendPendingScouts()
 
-	// Process platform events
-	err := c.platform.Spin(deadline)
-	if err != nil {
+	// Faithful to C platform->spin(deadline): advance the local clock to the
+	// deadline (the platform's blocking wait) and pump pending messages. The
+	// platform returns cy.OK as its success sentinel, which is non-nil when
+	// carried by the error interface, so we distinguish a real error from OK.
+	if err := c.platform.Spin(deadline); err != nil && err != OK {
 		return err
 	}
+
+	// Run all tasks now due by the clock, exactly like C olga_spin.
+	c.olga.Spin()
 
 	return OK
 }
