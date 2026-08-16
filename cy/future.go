@@ -419,6 +419,14 @@ const ResponseACKTimeoutMicrosecond = 1000000
 
 // RequestFuture is a future for request operations.
 // It represents a request that is waiting for responses.
+//
+// Faithful port of C cy_request_future_t: the completion state is computed on demand
+// (request_future_done) rather than stored as a one-shot flag. The future is "done"
+// when at least one response has been received (and not yet moved) OR when the
+// inter-response liveness deadline has fired -- so it may flip done<->pending
+// multiple times as responses stream in and are consumed. Each fresh response
+// re-arms the liveness deadline (request_on_response), and cy_response_move
+// (MoveResponse) nulls the stored response so Done() flips back to pending.
 type RequestFuture struct {
 	futureBase
 
@@ -428,14 +436,32 @@ type RequestFuture struct {
 	// rpc is the owning RPC, used to hand off the ack record at Destroy.
 	rpc *RPC
 
-	// responses contains received responses.
+	// responseMu guards the response state below. Lock order: rpc.mu -> responseMu.
+	responseMu sync.RWMutex
+
+	// responses holds at most the single most-recent response, faithful to C
+	// last_response (overwritten on each new response). Length is 0 or 1.
 	responses []Response
 
-	// responseCount is the total number of responses received.
+	// responseCount is the number of unique responses received after deduplication
+	// from all remotes combined (faithful to C response_count).
 	responseCount uint64
 
-	// mu protects the responses slice.
-	responseMu sync.RWMutex
+	// err is the current error: OK after a response, ErrLiveness after the liveness
+	// deadline fires, ErrNACK after an explicit cancel.
+	err Error
+
+	// livenessTimeout is the inter-response liveness window (== responseTimeout from Request).
+	livenessTimeout Microsecond
+
+	// livenessTask is the armed olga task for the current deadline; nil when disarmed.
+	// Guarded by rpc.mu.
+	livenessTask *olga.Task
+
+	// livenessExpired is true once the liveness deadline has fired, or the future has
+	// been cancelled/destroyed. Mirrors C's "!future_deadline_armed": a disarmed
+	// deadline makes the future done.
+	livenessExpired bool
 
 	// ack is the requester-side reliable-response dedup record, lazily created on the first
 	// reliable response. Handed off to RPC at Destroy so retransmits keep getting answered.
@@ -456,14 +482,43 @@ func (f *RequestFuture) Tag() uint64 {
 	return f.tag
 }
 
-// ResponseCount returns the number of responses received.
+// Done returns true when the future has a pending response (and has not been moved)
+// or when the liveness deadline has fired/expired. It flips back to false after
+// MoveResponse consumes the stored response while the liveness window is still open,
+// faithfully modeling the sampling-port contract (cy_request_future_done).
+func (f *RequestFuture) Done() bool {
+	f.responseMu.RLock()
+	defer f.responseMu.RUnlock()
+	return len(f.responses) > 0 || f.livenessExpired
+}
+
+// Error returns the current (or final) error of the request future.
+func (f *RequestFuture) Error() Error {
+	f.responseMu.RLock()
+	defer f.responseMu.RUnlock()
+	return f.err
+}
+
+// SetCallback sets a callback to be invoked when the request updates (each new
+// response / liveness timeout). If the future is already done, the callback is
+// invoked immediately. Overrides the futureBase default because Done() is computed.
+func (f *RequestFuture) SetCallback(callback func(Future)) {
+	f.futureBase.mu.Lock()
+	f.futureBase.callback = callback
+	f.futureBase.mu.Unlock()
+	if f.Done() {
+		f.futureBase.notifyCallback()
+	}
+}
+
+// ResponseCount returns the number of unique responses received after dedup.
 func (f *RequestFuture) ResponseCount() uint64 {
 	f.responseMu.RLock()
 	defer f.responseMu.RUnlock()
 	return f.responseCount
 }
 
-// Responses returns all received responses.
+// Responses returns a snapshot of the stored (most recent) response, or empty.
 func (f *RequestFuture) Responses() []Response {
 	f.responseMu.RLock()
 	defer f.responseMu.RUnlock()
@@ -472,7 +527,9 @@ func (f *RequestFuture) Responses() []Response {
 	return results
 }
 
-// AddResponse adds a new response to the future.
+// AddResponse stores the response as the most recent one, faithful to C last_response.
+// It keeps only the latest response (queue length 1) and increments the unique
+// response count. Deduplication happens upstream in handleResponseCorrelation.
 func (f *RequestFuture) AddResponse(response Response) {
 	f.responseMu.Lock()
 	defer f.responseMu.Unlock()
@@ -480,11 +537,68 @@ func (f *RequestFuture) AddResponse(response Response) {
 	f.responses = append(f.responses, response)
 	f.responseCount++
 
-	// Keep only the most recent response if we have more than one
-	// (as per the C implementation, the queue length is 1)
+	// Keep only the most recent response (as per C, the queue length is 1).
 	if len(f.responses) > 1 {
 		f.responses = f.responses[len(f.responses)-1:]
 	}
+}
+
+// deliverResponse commits a fresh response: store it, mark OK, and re-arm the
+// inter-response liveness deadline. Faithful to C request_on_response. The caller
+// must hold rpc.mu (so the liveness task can be re-armed under that lock) and is
+// responsible for invoking the application callback afterwards (outside the lock).
+func (f *RequestFuture) deliverResponse(response Response) {
+	f.AddResponse(response)
+	f.responseMu.Lock()
+	f.err = OK
+	f.responseMu.Unlock()
+	f.rearmLiveness(response.Timestamp + f.livenessTimeout)
+}
+
+// rearmLiveness (re)schedules the liveness deadline. The caller must hold rpc.mu.
+// A fresh, in-flight response resets the inter-response window so the future only
+// completes with ErrLiveness when responses cease to arrive (request_on_response).
+func (f *RequestFuture) rearmLiveness(deadline Microsecond) {
+	if f.livenessTask != nil {
+		f.rpc.cy.olga.Cancel(f.livenessTask)
+		f.livenessTask = nil
+	}
+	f.livenessExpired = false
+	f.livenessTask = f.rpc.cy.olga.Schedule(int64(deadline), func() {
+		f.onLivenessTimeout()
+	})
+}
+
+// onLivenessTimeout fires when no response arrives within the liveness window.
+// Faithful to C request_future_timeout: it sets ErrLiveness and notifies, and the
+// future becomes permanently done (the deadline is now disarmed).
+func (f *RequestFuture) onLivenessTimeout() {
+	f.rpc.mu.Lock()
+	if f.livenessExpired {
+		f.rpc.mu.Unlock()
+		return // Already disarmed (cancel/destroy) or fired.
+	}
+	f.livenessTask = nil
+	f.livenessExpired = true
+	f.responseMu.Lock()
+	f.err = ErrLiveness
+	f.responseMu.Unlock()
+	f.rpc.mu.Unlock()
+	// Notify outside rpc.mu so a callback that destroys the future cannot deadlock.
+	f.futureBase.notifyCallback()
+}
+
+// cancel disarms the future and completes it with the given error (used by CancelRequest).
+// The caller must hold rpc.mu.
+func (f *RequestFuture) cancel(err Error) {
+	if f.livenessTask != nil {
+		f.rpc.cy.olga.Cancel(f.livenessTask)
+		f.livenessTask = nil
+	}
+	f.livenessExpired = true
+	f.responseMu.Lock()
+	f.err = err
+	f.responseMu.Unlock()
 }
 
 // BorrowResponse returns the last received response without removing it.
@@ -500,8 +614,10 @@ func (f *RequestFuture) BorrowResponse() *Response {
 	return &f.responses[len(f.responses)-1]
 }
 
-// MoveResponse returns the last received response and removes it from the queue.
-// Returns nil if no response has been received.
+// MoveResponse returns the last received response and removes it from the future.
+// Returns nil if no response has been received. Mirrors C cy_response_move: nulling
+// the stored response lets Done() flip back to pending so the application can keep
+// sampling a stream of responses.
 func (f *RequestFuture) MoveResponse() *Response {
 	f.responseMu.Lock()
 	defer f.responseMu.Unlock()
@@ -524,24 +640,38 @@ func (f *RequestFuture) MoveResponse() *Response {
 // record, never re-delivered into a dead future), and any reliable-response dedup record that
 // acked something is retained so retransmitted reliable responses keep getting answered.
 func (f *RequestFuture) Destroy() {
-	f.responseMu.Lock()
-	ack := f.ack
-	f.responses = nil
-	f.responseMu.Unlock()
-
 	if f.rpc != nil {
 		f.rpc.mu.Lock()
-		// De-index at dispose (C future_index_remove). Release responseMu first to avoid a
-		// lock-order inversion with handleResponseCorrelation (which holds r.mu then responseMu).
+		// De-index at dispose (C future_index_remove). Read the ack under rpc.mu, consistent
+		// with handleResponseCorrelation, so no separate responseMu acquisition is needed here.
+		ack := f.ack
+		f.ack = nil
 		delete(f.rpc.requests, f.tag)
-		if ack != nil && (ack.solo || ack.tree != nil) {
+		if ack != nil && (ack.solo || len(ack.tree) > 0) {
 			f.rpc.retainRequestAck(ack, f.rpc.cy.Now())
 		}
-		f.ack = nil
+		// Disarm the liveness task so Done() reflects disposal and no late callback re-enters.
+		if f.livenessTask != nil {
+			f.rpc.cy.olga.Cancel(f.livenessTask)
+			f.livenessTask = nil
+		}
+		f.livenessExpired = true
 		f.rpc.mu.Unlock()
 	}
 
 	f.futureBase.Destroy()
+}
+
+// IsRequest reports whether the future is a request future, faithful to C cy_is_request.
+func IsRequest(future Future) bool {
+	_, ok := future.(*RequestFuture)
+	return ok
+}
+
+// IsSubscriber reports whether the future is a subscription future, faithful to C cy_is_subscriber.
+func IsSubscriber(future Future) bool {
+	_, ok := future.(*SubscriptionFuture)
+	return ok
 }
 
 // Response represents a response to a request.

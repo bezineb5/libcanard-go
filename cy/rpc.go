@@ -140,23 +140,24 @@ func bitmapShiftLeft(bitmap []uint64, shift int) {
 // requestAckRemote is the per-remote dedup state, faithful to C request_future_remote_t.
 // bit 0 == seqnoTop, bit 1 == seqnoTop-1, ..., in the seqnoAcked bitmap.
 type requestAckRemote struct {
-	remoteID  uint64
-	seqnoTop  uint64
+	remoteID   uint64
+	seqnoTop   uint64
 	seqnoAcked [3]uint64 // bitmapWords(REQUEST_FUTURE_HISTORY) == 3
 }
 
 // requestAck is the requester-side reliable-response deduplication record.
 // Faithful to C request_ack_t. It is owned by the RequestFuture until the future is destroyed,
 // at which point it is handed over to RPC.requestAcks to answer retransmits on its own.
-//   solo  -- a single remote (soloRemoteID) acked seqno 0.
-//   !solo -- promoted: per-remote bitmaps (tree), same rule as the live path.
-//   !solo, empty tree -- nothing acked, answers NACK to everything (never retained).
+//
+//	solo  -- a single remote (soloRemoteID) acked seqno 0.
+//	!solo -- promoted: per-remote bitmaps (tree), same rule as the live path.
+//	!solo, empty tree -- nothing acked, answers NACK to everything (never retained).
 type requestAck struct {
-	tag         uint64
-	deadAt      Microsecond
-	solo        bool
+	tag          uint64
+	deadAt       Microsecond
+	solo         bool
 	soloRemoteID uint64
-	tree        map[uint64]*requestAckRemote
+	tree         map[uint64]*requestAckRemote
 }
 
 // test answers a retransmitted reliable response from (remoteID, seqno) without involving the
@@ -231,10 +232,10 @@ func (a *requestAck) admit(remoteID, seqno uint64, outFresh *bool) responseRx {
 	return responseRxAck
 }
 
-
 // RequestHandler is a function that handles incoming requests.
 // It receives the request data and a responder for sending responses.
 type RequestHandler func(data []byte, responder *Responder)
+
 // Responder allows sending responses to a request. It carries the breadcrumb of the
 // original request so responses are sent back to the correct remote with the correct
 // correlation tag (message_tag) and stream sequence number.
@@ -261,14 +262,15 @@ type Responder struct {
 func newRPC(cy *Cy) *RPC {
 	return &RPC{
 		cy:             cy,
-		requests:      make(map[uint64]*RequestFuture),
+		requests:       make(map[uint64]*RequestFuture),
 		nextRequestTag: 0,
-		services:      make(map[uint32]RequestHandler),
-		streams:       make(map[uint64]*Streaming),
+		services:       make(map[uint32]RequestHandler),
+		streams:        make(map[uint64]*Streaming),
 		respondFutures: make(map[uint64]*RespondFuture),
 		requestAcks:    make(map[uint64]*requestAck),
+	}
 }
-}
+
 // Request sends a request message and returns a future for responses.
 // The deliveryDeadline is when the request must be delivered by.
 // The responseTimeout is how long to wait for responses after delivery.
@@ -284,6 +286,7 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 
 	// Create the future
 	future := NewRequestFuture(r, tag)
+	future.livenessTimeout = responseTimeout
 	r.requests[tag] = future
 	r.mu.Unlock()
 
@@ -292,7 +295,8 @@ func (r *RPC) Request(pub *Publisher, deliveryDeadline, responseTimeout Microsec
 	pub.pendingRequests[tag] = future
 	pub.mu.Unlock()
 
-	// Set up response timeout
+	// Arm the initial response deadline (C: future_deadline_arm(delivery_deadline + response_timeout)).
+	// Each subsequent fresh response re-arms a per-response liveness window via deliverResponse.
 	r.cy.olga.Schedule(int64(deliveryDeadline+responseTimeout), func() {
 		r.handleResponseTimeout(tag, future)
 	})
@@ -323,20 +327,10 @@ func (r *RPC) sendRequestMessage(pub *Publisher, tag uint64, deadline Microsecon
 	_ = r.cy.platform.Unicast(lane, deadline, headed)
 }
 
-// handleResponseTimeout handles timeout for a request.
+// handleResponseTimeout is the initial/deadline liveness callback. It delegates to the
+// future's onLivenessTimeout which locks rpc.mu as needed. Faithful to C request_future_timeout.
 func (r *RPC) handleResponseTimeout(tag uint64, future *RequestFuture) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Check if we have responses
-	if future.ResponseCount() == 0 {
-		future.complete(ErrLiveness)
-	} else {
-		future.complete(OK)
-	}
-
-	// Clean up
-	delete(r.requests, tag)
+	future.onLivenessTimeout()
 }
 
 // handleResponseCorrelation processes an incoming response for the given message tag, faithfully
@@ -347,25 +341,25 @@ func (r *RPC) handleResponseTimeout(tag uint64, future *RequestFuture) {
 //   - If the future is gone but a handed-off ack record exists (post-destroy): a reliable response
 //     is answered from the record (ACK/NACK) without involving the app.
 //   - Otherwise an orphan reliable response is NACKed; an orphan best-effort response is dropped.
+//
 // Returns the wire verdict (responseRxSilent means no ACK/NACK is to be sent). Caller holds r.mu.
-func (r *RPC) handleResponseCorrelation(messageTag, remoteID, seqno uint64, reliable bool, response Response) responseRx {
+func (r *RPC) handleResponseCorrelation(messageTag, remoteID, seqno uint64, reliable bool, response Response) (*RequestFuture, responseRx) {
 	future, ok := r.requests[messageTag]
 	if !ok {
 		// Future is gone. A reliable retransmit is still answerable from a handed-off record.
 		if !reliable {
-			return responseRxSilent
+			return nil, responseRxSilent
 		}
 		if ack, found := r.requestAcks[messageTag]; found && ack.test(remoteID, seqno) {
-			return responseRxAck
+			return nil, responseRxAck
 		}
-		return responseRxNack
+		return nil, responseRxNack
 	}
 
 	if !reliable {
 		// Best-effort: always deliver, never ACK, keep the future pending.
-		future.AddResponse(response)
-		r.scheduleResponseLiveness(messageTag, future)
-		return responseRxSilent
+		future.deliverResponse(response)
+		return future, responseRxSilent
 	}
 
 	// Reliable: deduplicate.
@@ -375,20 +369,11 @@ func (r *RPC) handleResponseCorrelation(messageTag, remoteID, seqno uint64, reli
 	var fresh bool
 	verdict := future.ack.admit(remoteID, seqno, &fresh)
 	if !fresh {
-		return verdict // Duplicate, too old, or transient: app must not see it.
+		return nil, verdict // Duplicate, too old, or transient: app must not see it.
 	}
 	// Fresh reliable response: deliver exactly once.
-	future.AddResponse(response)
-	r.scheduleResponseLiveness(messageTag, future)
-	return responseRxAck
-}
-
-// scheduleResponseLiveness resets the inter-response liveness timeout, mirroring C's
-// future_deadline_arm after a newly admitted response.
-func (r *RPC) scheduleResponseLiveness(tag uint64, future *RequestFuture) {
-	r.cy.olga.Schedule(int64(r.cy.Now()+responseTimeout), func() {
-		r.handleResponseTimeout(tag, future)
-	})
+	future.deliverResponse(response)
+	return future, responseRxAck
 }
 
 // HandleResponse is retained for backward compatibility / external callers: it delivers a
@@ -396,16 +381,16 @@ func (r *RPC) scheduleResponseLiveness(tag uint64, future *RequestFuture) {
 // New faithful reliable handling goes through handleResponseCorrelation.
 func (r *RPC) HandleResponse(tag uint64, response Response) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	future, ok := r.requests[tag]
 	if !ok {
+		r.mu.Unlock()
 		return
 	}
-	future.AddResponse(response)
-	r.scheduleResponseLiveness(tag, future)
+	future.deliverResponse(response)
+	r.mu.Unlock()
+	// Notify outside rpc.mu (see handleResponseMessage).
+	future.futureBase.notifyCallback()
 }
-
 
 // HandleRequest handles an incoming request. The request payload (after the 24-byte
 // header has been skipped by HandleMessage) carries [tag:8][requestID:4][serviceID:4][data].
@@ -433,18 +418,21 @@ func (r *RPC) HandleRequest(tag, requestID uint64, sourceNodeID uint64, message 
 	handler(requestData, responder)
 }
 
-// CancelRequest cancels a pending request.
+// CancelRequest cancels a pending request. Faithful to the Go API's explicit cancel: the
+// future is disarmed and completed with ErrNACK (cy_request_cancel has no exact C analogue,
+// but the requester-side dispose/disarm makes the future done).
 func (r *RPC) CancelRequest(tag uint64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	future, ok := r.requests[tag]
 	if !ok {
+		r.mu.Unlock()
 		return
 	}
 
-	future.complete(ErrNACK)
 	delete(r.requests, tag)
+	future.cancel(ErrNACK)
+	r.mu.Unlock()
+	future.futureBase.notifyCallback()
 }
 
 // RegisterService registers a handler for a service.
@@ -632,6 +620,7 @@ func (f *RespondFuture) remove() {
 	}
 	f.rpc.mu.Unlock()
 }
+
 // sendResponseAck emits a unicast response ACK/NACK back to the responder for a reliable
 // response we just received. Faithful port of C send_response_ack: header[0]=type,
 // [1]=tag, [2:8]=seqno(u48), [8:16]=hash, [16:24]=message_tag. positive selects ACK/NACK.

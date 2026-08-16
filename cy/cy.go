@@ -610,9 +610,15 @@ func (c *Cy) onScout(pattern string, lane Lane, now Microsecond) {
 // ACK (fresh/known) or NACK (orphan/too-old) on the wire. Best-effort responses are delivered silently.
 func (c *Cy) handleResponseMessage(lane Lane, messageTag, seqno uint64, tag byte, hash uint64, reliable bool, response Response) {
 	c.rpc.mu.Lock()
-	verdict := c.rpc.handleResponseCorrelation(messageTag, response.RemoteID, seqno, reliable, response)
+	fut, verdict := c.rpc.handleResponseCorrelation(messageTag, response.RemoteID, seqno, reliable, response)
 	c.rpc.sweepRequestAcks(c.Now())
 	c.rpc.mu.Unlock()
+
+	// Notify the application outside rpc.mu so a callback that destroys/cancels the
+	// future (which re-locks rpc.mu) cannot deadlock.
+	if fut != nil {
+		fut.futureBase.notifyCallback()
+	}
 
 	if reliable && verdict != responseRxSilent {
 		c.rpc.sendResponseAck(lane, messageTag, seqno, tag, hash, verdict == responseRxAck)
