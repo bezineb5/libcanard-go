@@ -20,7 +20,7 @@ func TestUDPRXDropsMalformedDatagramsWithoutLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create UDP platform: %v", err)
 	}
-	defer platform.Destroy()
+	defer asUDP(platform).Destroy()
 
 	// Create Cy instance
 	node, err := cy.New(platform, "udp_malformed", "", "")
@@ -44,7 +44,7 @@ func TestUDPRXDropsMalformedDatagramsWithoutLeak(t *testing.T) {
 	// In a real test, we would send malformed UDP datagrams directly
 	// and verify they are dropped without memory leaks.
 	// For this unit test, we just verify the platform doesn't crash
-	
+
 	t.Log("UDP malformed datagram handling test - basic structure verified")
 }
 
@@ -54,10 +54,10 @@ func TestUDPRXDropsMalformedDatagramsWithoutLeak(t *testing.T) {
 func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 	const senderUID = uint64(0xD000000000000001)
 	const receiverUID = uint64(0xD000000000000002)
-	
+
 	// We need to test that restarting nodes in the same second uses fresh transfer IDs
 	// This is a timing-sensitive test, so we'll try multiple times
-	
+
 	exercised := false
 	for attempt := 0; attempt < 8 && !exercised; attempt++ {
 		// Wait for a new wall clock second
@@ -65,106 +65,106 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		for time.Now().Unix() == started {
 			time.Sleep(10 * time.Millisecond)
 		}
-		
+
 		// Create receiver
 		receiverPlatform, err := udp.NewManual(receiverUID, []uint32{}, 256)
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			continue
 		}
-		
+
 		receiver, err := cy.New(receiverPlatform, "udp_restart_receiver", "", "")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			continue
 		}
-		
+
 		// Subscribe to topic
 		sub, err := receiver.Subscribe("udp/restart#401", 64)
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			continue
 		}
-		
+
 		// Check we're still in the same second
 		if time.Now().Unix() != started {
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			continue
 		}
-		
+
 		// Create first sender
 		senderAPlatform, err := udp.NewManual(senderUID, []uint32{}, 256)
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			continue
 		}
-		
+
 		senderA, err := cy.New(senderAPlatform, "udp_restart_sender_a", "", "")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
-			senderAPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
+			asUDP(senderAPlatform).Destroy()
 			continue
 		}
-		
+
 		// Check we're still in the same second
 		if time.Now().Unix() != started {
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			senderA.Destroy()
-			senderAPlatform.Destroy()
+			asUDP(senderAPlatform).Destroy()
 			continue
 		}
-		
+
 		// Create second sender
 		senderBPlatform, err := udp.NewManual(senderUID, []uint32{}, 256)
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			senderA.Destroy()
-			senderAPlatform.Destroy()
+			asUDP(senderAPlatform).Destroy()
 			continue
 		}
-		
+
 		senderB, err := cy.New(senderBPlatform, "udp_restart_sender_b", "", "")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			senderA.Destroy()
-			senderAPlatform.Destroy()
-			senderBPlatform.Destroy()
+			asUDP(senderAPlatform).Destroy()
+			asUDP(senderBPlatform).Destroy()
 			continue
 		}
-		
+
 		// Advertise from sender A
 		pubA, err := senderA.Advertise("udp/restart#401")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			senderA.Destroy()
-			senderAPlatform.Destroy()
+			asUDP(senderAPlatform).Destroy()
 			senderB.Destroy()
-			senderBPlatform.Destroy()
+			asUDP(senderBPlatform).Destroy()
 			continue
 		}
-		
+
 		// Spin both nodes
 		if err := senderA.Spin(senderA.Now() + 3000); err != nil {
 			t.Logf("Spin error: %v", err)
@@ -172,14 +172,14 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		if err := receiver.Spin(receiver.Now() + 3000); err != nil {
 			t.Logf("Spin error: %v", err)
 		}
-		
+
 		// Publish from A
 		payloadA := []byte{0x11}
 		deadlineA := senderA.Now() + 40000
 		if err := pubA.Publish(deadlineA, payloadA); err != nil {
 			t.Logf("Publish A error: %v", err)
 		}
-		
+
 		// Wait for message to arrive
 		for i := 0; i < 80; i++ {
 			if err := senderA.Spin(senderA.Now() + 1000); err != nil {
@@ -194,30 +194,30 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
-		
+
 		// Clean up A
 		pubA.Destroy()
-		
+
 		// Publish from B
 		pubB, err := senderB.Advertise("udp/restart#401")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			receiverPlatform.Destroy()
+			asUDP(receiverPlatform).Destroy()
 			senderA.Destroy()
-			senderAPlatform.Destroy()
+			asUDP(senderAPlatform).Destroy()
 			senderB.Destroy()
-			senderBPlatform.Destroy()
+			asUDP(senderBPlatform).Destroy()
 			continue
 		}
-		
+
 		payloadB := []byte{0x22}
 		deadlineB := senderB.Now() + 40000
 		if err := pubB.Publish(deadlineB, payloadB); err != nil {
 			t.Logf("Publish B error: %v", err)
 		}
-		
+
 		// Wait for second message
 		arrived := false
 		for i := 0; i < 80; i++ {
@@ -234,22 +234,22 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
-		
+
 		if arrived {
 			exercised = true
 		}
-		
+
 		// Clean up
 		pubB.Destroy()
 		sub.Destroy()
 		receiver.Destroy()
-		receiverPlatform.Destroy()
+		asUDP(receiverPlatform).Destroy()
 		senderA.Destroy()
-		senderAPlatform.Destroy()
+		asUDP(senderAPlatform).Destroy()
 		senderB.Destroy()
-		senderBPlatform.Destroy()
+		asUDP(senderBPlatform).Destroy()
 	}
-	
+
 	if !exercised {
 		t.Log("Failed to exercise restart test after 8 attempts (timing-sensitive test)")
 	}
@@ -264,7 +264,7 @@ func TestUDPSpinRetriesAfterSignalEINTR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create UDP platform: %v", err)
 	}
-	defer platform.Destroy()
+	defer asUDP(platform).Destroy()
 
 	// Create Cy instance
 	node, err := cy.New(platform, "udp_eintr", "", "")
@@ -276,16 +276,16 @@ func TestUDPSpinRetriesAfterSignalEINTR(t *testing.T) {
 	// In Go, the runtime automatically handles EINTR for syscalls
 	// The UDP platform should handle this gracefully
 	// We'll just verify that spin doesn't hang or error
-	
+
 	// Set a deadline far in the future
 	deadline := node.Now() + 120000 // 120ms
-	
+
 	// Spin until deadline
 	err = node.SpinUntil(deadline)
 	if err != cy.OK {
 		t.Errorf("SpinUntil returned error: %v", err)
 	}
-	
+
 	// If we get here, spin completed without hanging
 	// In Go, EINTR is handled transparently, so we can't easily test it directly
 	// But the test verifies that spin works correctly

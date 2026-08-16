@@ -1,6 +1,6 @@
 module github.com/opencyphal/cy-go/udp
 
-go 1.21
+go 1.22
 
 require github.com/opencyphal/cy-go v0.0.0
 
