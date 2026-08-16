@@ -436,14 +436,32 @@ type Platform struct {
 
 // New creates a UDP platform bound to all interfaces with an ephemeral local
 // port. A semi-random UID is generated when uid is zero.
-func New() (cy.Platform, error) {
+// PlatformUDP is the Cyphal/UDP platform interface. It extends cy.Platform with the
+// UDP-specific operations (local endpoint, namespace, and live transport stats).
+// udp.New, udp.NewWithAddress, and udp.NewManual all return a PlatformUDP, which is
+// therefore assignable to cy.Platform wherever only the base transport API is needed.
+type PlatformUDP interface {
+	cy.Platform
+
+	// Home returns the local endpoint address string for the given prefix
+	// (e.g. "" or "udp"). It is UDP-specific.
+	Home(prefix string) string
+
+	// Namespace returns the platform's UDP multicast namespace.
+	Namespace() string
+
+	// Stats returns the number of live subject writers and readers.
+	Stats() (subjectWriterCount int, subjectReaderCount int)
+}
+
+func New() (PlatformUDP, error) {
 	return NewWithAddress("", 0, 0)
 }
 
 // NewWithAddress creates a UDP platform. An empty address listens on all
 // interfaces; port 0 selects an ephemeral local port. The UID is generated
 // randomly when zero.
-func NewWithAddress(address string, port int, uid uint64) (cy.Platform, error) {
+func NewWithAddress(address string, port int, uid uint64) (PlatformUDP, error) {
 	localIPs, _ := localIPv4Addrs(nil)
 	return newPlatform(uid, nil, localIPs, port, address)
 }
@@ -452,7 +470,7 @@ func NewWithAddress(address string, port int, uid uint64) (cy.Platform, error) {
 // cy_udp_posix_new_manual. Unused (zero) interface addresses are ignored; an
 // empty slice listens on all interfaces. txQueueCapacity is accepted for API
 // compatibility (the Go implementation does not require a fixed queue size).
-func NewManual(uid uint64, localIfaceAddresses []uint32, txQueueCapacity int) (cy.Platform, error) {
+func NewManual(uid uint64, localIfaceAddresses []uint32, txQueueCapacity int) (PlatformUDP, error) {
 	var ifaces []net.IP
 	for _, a := range localIfaceAddresses {
 		if a != 0 {

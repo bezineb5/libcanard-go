@@ -82,6 +82,11 @@ type Platform interface {
 	// SetCy sets the Cy instance reference (called by cy.New).
 	// This allows the platform to access the Cy instance if needed.
 	SetCy(cy *Cy)
+
+	// Destroy releases any resources owned by the platform (sockets, goroutines,
+	// allocated memory, etc.). It must be safe to call after the owning Cy
+	// instance has been destroyed.
+	Destroy()
 }
 
 // SubjectWriter is used to send messages on a specific subject-ID.

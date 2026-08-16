@@ -24,7 +24,7 @@ type testReader struct {
 }
 
 func (r *testReader) SubjectID() uint32 { return r.subjectID }
-func (r *testReader) Extent() int      { return r.extent }
+func (r *testReader) Extent() int       { return r.extent }
 func (r *testReader) SetExtent(e int)   { r.extent = e }
 
 func (p *testPlatform) NewSubjectWriter(subjectID uint32) (SubjectWriter, error) {
@@ -36,7 +36,8 @@ func (p *testPlatform) NewSubjectReader(subjectID uint32, extent int) (SubjectRe
 }
 
 func (p *testPlatform) Now() Microsecond { return p.nowValue }
-func (p *testPlatform) Random() uint64  { return 1 }
+func (p *testPlatform) Destroy()         {}
+func (p *testPlatform) Random() uint64   { return 1 }
 func (p *testPlatform) Realloc(ptr unsafe.Pointer, size int) unsafe.Pointer {
 	if size == 0 {
 		return nil

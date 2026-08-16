@@ -17,7 +17,7 @@ This is a migration of the [OpenCyphal-Garage/cy](https://github.com/OpenCyphal-
 - ✅ **CAN transport** (SocketCAN) - *Complete*
 - ✅ **UDP transport** - *Complete*
 - ✅ Fault injection framework for testing
-- ✅ Comprehensive test suite (248+ tests)
+- ✅ Comprehensive test suite (240+ tests)
 
 ## Installation
 
@@ -199,6 +199,8 @@ cy/
 ├── Core Session Layer
 │   ├── types.go            # Basic types and constants
 │   ├── cy.go               # Main Cy instance
+│   ├── diag.go             # Diagnostics (per-node health/status)
+│   ├── name.go             # Node naming / service discovery
 │   ├── topic.go            # Topic management
 │   ├── platform.go         # Platform abstraction
 │   ├── message.go          # Message handling
@@ -225,15 +227,9 @@ cy/
 │   ├── cavl/
 │   │   ├── tree.go         # AVL tree implementation
 │   │   └── tests/          # AVL tree tests (12 tests)
-│   ├── olga/
+│   └── olga/
 │   │   ├── scheduler.go    # Event scheduler
 │   │   └── tests/          # Scheduler tests (18 tests)
-│   ├── rapidhash/
-│   │   ├── hash.go         # Hash function
-│   │   └── tests/          # Hash tests (6 tests)
-│   └── wkv/
-│       ├── container.go    # Pattern matching container
-│       └── tests/          # Container tests (17 tests)
 │
 └── Tests
     ├── test_support.go     # MockPlatform, SimNetwork
@@ -252,18 +248,13 @@ cy/
 # Run all tests
 cd cy && go test ./... -timeout 30s
 
-# Results: 248+ tests passing ✅
+# Results: 240+ tests passing ✅
 ```
 
 ## Documentation
 
-- [Migration Plan](./CY_MIGRATION_PLAN.md) - Original migration plan
-- [Migration Summary](./CY_MIGRATION_SUMMARY.md) - Migration progress summary
-- [CRDT Status](./CY_CRDT_STATUS.md) - CRDT implementation details
-- [CRDT Completed](./CY_CRDT_COMPLETED.md) - CRDT completion summary
-- [Test Porting Completed](./CY_TEST_PORTING_COMPLETED.md) - Test porting summary
-- [Final Status](./CY_FINAL_STATUS.md) - Complete migration status
-- [Cyphal Specification](../../Cyphal_Specification.md)
+The planning and migration notes referenced during the C->Go port (CY_*.md, Cyphal_Specification.md) are no longer part of this repository. For usage details, consult the package source under `cy/` and the tests in `cy/tests` and `cy/*/tests`.
+
 
 ## Building
 
@@ -287,9 +278,7 @@ cd cy && go test ./... -timeout 30s
 - ✅ Manual endpoint configuration
 - ✅ POSIX-compatible
 
-## Contributing
 
-See [CONTRIBUTING.md](../../CONTRIBUTING.md) for development guidelines.
 
 ## License
 

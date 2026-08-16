@@ -20,7 +20,7 @@ func TestUDPRXDropsMalformedDatagramsWithoutLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create UDP platform: %v", err)
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create Cy instance
 	node, err := cy.New(platform, "udp_malformed", "", "")
@@ -76,7 +76,7 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		receiver, err := cy.New(receiverPlatform, "udp_restart_receiver", "", "")
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			continue
 		}
 
@@ -85,7 +85,7 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		if err != nil {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			continue
 		}
 
@@ -93,7 +93,7 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		if time.Now().Unix() != started {
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			continue
 		}
 
@@ -103,7 +103,7 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			continue
 		}
 
@@ -112,8 +112,8 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
-			asUDP(senderAPlatform).Destroy()
+			receiverPlatform.Destroy()
+			senderAPlatform.Destroy()
 			continue
 		}
 
@@ -121,9 +121,9 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		if time.Now().Unix() != started {
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			senderA.Destroy()
-			asUDP(senderAPlatform).Destroy()
+			senderAPlatform.Destroy()
 			continue
 		}
 
@@ -133,9 +133,9 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			senderA.Destroy()
-			asUDP(senderAPlatform).Destroy()
+			senderAPlatform.Destroy()
 			continue
 		}
 
@@ -144,10 +144,10 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			senderA.Destroy()
-			asUDP(senderAPlatform).Destroy()
-			asUDP(senderBPlatform).Destroy()
+			senderAPlatform.Destroy()
+			senderBPlatform.Destroy()
 			continue
 		}
 
@@ -157,11 +157,11 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			senderA.Destroy()
-			asUDP(senderAPlatform).Destroy()
+			senderAPlatform.Destroy()
 			senderB.Destroy()
-			asUDP(senderBPlatform).Destroy()
+			senderBPlatform.Destroy()
 			continue
 		}
 
@@ -204,11 +204,11 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 			t.Logf("Skipping attempt %d: %v", attempt, err)
 			sub.Destroy()
 			receiver.Destroy()
-			asUDP(receiverPlatform).Destroy()
+			receiverPlatform.Destroy()
 			senderA.Destroy()
-			asUDP(senderAPlatform).Destroy()
+			senderAPlatform.Destroy()
 			senderB.Destroy()
-			asUDP(senderBPlatform).Destroy()
+			senderBPlatform.Destroy()
 			continue
 		}
 
@@ -243,11 +243,11 @@ func TestUDPManualRestartUsesFreshTransferIDSeed(t *testing.T) {
 		pubB.Destroy()
 		sub.Destroy()
 		receiver.Destroy()
-		asUDP(receiverPlatform).Destroy()
+		receiverPlatform.Destroy()
 		senderA.Destroy()
-		asUDP(senderAPlatform).Destroy()
+		senderAPlatform.Destroy()
 		senderB.Destroy()
-		asUDP(senderBPlatform).Destroy()
+		senderBPlatform.Destroy()
 	}
 
 	if !exercised {
@@ -264,7 +264,7 @@ func TestUDPSpinRetriesAfterSignalEINTR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create UDP platform: %v", err)
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create Cy instance
 	node, err := cy.New(platform, "udp_eintr", "", "")

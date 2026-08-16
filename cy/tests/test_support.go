@@ -250,6 +250,7 @@ func (r *mockSubjectReader) SetExtent(extent int) {
 
 // Ensure interfaces are satisfied
 var _ cy.Platform = (*MockPlatform)(nil)
+
 var _ cy.SubjectWriter = (*mockSubjectWriter)(nil)
 var _ cy.SubjectReader = (*mockSubjectReader)(nil)
 

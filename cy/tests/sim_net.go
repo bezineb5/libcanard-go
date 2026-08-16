@@ -443,5 +443,8 @@ func (r *SimSubjectReader) SetExtent(extent int) {
 
 // Ensure interfaces are satisfied
 var _ cy.Platform = (*SimPlatform)(nil)
+
+func (p *SimPlatform) Destroy() {}
+
 var _ cy.SubjectWriter = (*SimSubjectWriter)(nil)
 var _ cy.SubjectReader = (*SimSubjectReader)(nil)

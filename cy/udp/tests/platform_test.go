@@ -8,11 +8,6 @@ import (
 	"github.com/opencyphal/cy-go/udp"
 )
 
-// asUDP resolves the concrete UDP platform from the cy.Platform returned by the
-// udp.New* constructors. The constructors return the interface; udp-specific
-// methods (Destroy, Home, Namespace, Stats) live only on *udp.Platform.
-func asUDP(p cy.Platform) *udp.Platform { return p.(*udp.Platform) }
-
 // TestNew tests the New function.
 func TestNew(t *testing.T) {
 	// Test default constructor
@@ -20,7 +15,7 @@ func TestNew(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create UDP platform: %v", err)
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	if platform == nil {
 		t.Error("Expected platform, got nil")
@@ -81,7 +76,7 @@ func TestNewWithAddress(t *testing.T) {
 			}
 
 			// Clean up
-			asUDP(platform).Destroy()
+			platform.Destroy()
 		})
 	}
 }
@@ -94,7 +89,7 @@ func TestNewManual(t *testing.T) {
 		t.Logf("Skipping test: %v", err)
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	if platform == nil {
 		t.Error("Expected platform, got nil")
@@ -110,10 +105,10 @@ func TestDestroy(t *testing.T) {
 	}
 
 	// Destroy should not panic
-	asUDP(platform).Destroy()
+	platform.Destroy()
 
 	// Destroy again should not panic
-	asUDP(platform).Destroy()
+	platform.Destroy()
 }
 
 // TestNewSubjectWriter tests creating subject writers.
@@ -123,7 +118,7 @@ func TestNewSubjectWriter(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create a subject writer
 	writer, err := platform.NewSubjectWriter(123)
@@ -149,7 +144,7 @@ func TestDestroySubjectWriter(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create and destroy a subject writer
 	writer, err := platform.NewSubjectWriter(123)
@@ -170,7 +165,7 @@ func TestNewSubjectReader(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create a subject reader
 	reader, err := platform.NewSubjectReader(123, 256)
@@ -200,7 +195,7 @@ func TestSetSubjectReaderExtent(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create a subject reader
 	reader, err := platform.NewSubjectReader(123, 256)
@@ -223,7 +218,7 @@ func TestNow(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Get current time
 	now := platform.Now()
@@ -241,7 +236,7 @@ func TestRandom(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Get random value
 	rand1 := platform.Random()
@@ -260,7 +255,7 @@ func TestRealloc(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Allocate some memory
 	ptr1 := platform.Realloc(nil, 100)
@@ -289,16 +284,16 @@ func TestHome(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Test with no prefix
-	home := asUDP(platform).Home("")
+	home := platform.Home("")
 	if len(home) != 16 {
 		t.Errorf("Expected 16 character home, got %d: %s", len(home), home)
 	}
 
 	// Test with prefix
-	homeWithPrefix := asUDP(platform).Home("udp")
+	homeWithPrefix := platform.Home("udp")
 	if len(homeWithPrefix) != 20 { // "udp/" + 16 hex chars = 20
 		t.Errorf("Expected 20 character home with prefix, got %d: %s", len(homeWithPrefix), homeWithPrefix)
 	}
@@ -311,10 +306,10 @@ func TestNamespace(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Get namespace (should be empty if CYPHAL_NAMESPACE not set)
-	ns := asUDP(platform).Namespace()
+	ns := platform.Namespace()
 	// Just verify it doesn't panic
 	_ = ns
 }
@@ -326,10 +321,10 @@ func TestStats(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Get stats
-	writerCount, readerCount := asUDP(platform).Stats()
+	writerCount, readerCount := platform.Stats()
 
 	// Should be zero initially
 	if writerCount != 0 {
@@ -344,7 +339,7 @@ func TestStats(t *testing.T) {
 	platform.NewSubjectReader(456, 256)
 
 	// Stats should reflect the new counts
-	writerCount, readerCount = asUDP(platform).Stats()
+	writerCount, readerCount = platform.Stats()
 	if writerCount != 1 {
 		t.Errorf("Expected 1 writer, got %d", writerCount)
 	}
@@ -360,7 +355,7 @@ func TestSpin(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Spin should not panic or block indefinitely
 	// Note: Spin returns cy.OK (Error(0)) which is not nil but is not an error
@@ -377,7 +372,7 @@ func TestSetCy(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// SetCy should not panic with nil
 	platform.SetCy(nil)
@@ -390,7 +385,7 @@ func TestMultipleWriters(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create multiple writers
 	for i := 0; i < 10; i++ {
@@ -409,7 +404,7 @@ func TestMultipleReaders(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create multiple readers
 	for i := 0; i < 10; i++ {
@@ -428,7 +423,7 @@ func TestUnicast(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Create a lane
 	lane := cy.Lane{
@@ -450,7 +445,7 @@ func TestSetUnicastExtent(t *testing.T) {
 		t.Skip("Failed to create platform, skipping test")
 		return
 	}
-	defer asUDP(platform).Destroy()
+	defer platform.Destroy()
 
 	// Set unicast extent
 	platform.SetUnicastExtent(512)
