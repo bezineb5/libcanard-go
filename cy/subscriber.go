@@ -254,6 +254,18 @@ func (s *Subscriber) deliver(message MessageTS, lane Lane, msgTag uint64, topic 
 	})
 }
 
+// DeliverForTesting injects a fully-reassembled transfer directly into this
+// subscriber, bypassing the transport layer and Cy's topic routing. It is an
+// escape hatch for test harnesses and replay only; production code must never
+// call it. In production, transfers arrive via the platform (cy_on_message).
+// The subscriber's own topic is used for breadcrumb tagging.
+func (s *Subscriber) DeliverForTesting(message MessageTS, lane Lane, msgTag uint64) bool {
+	s.mu.RLock()
+	topic := s.topic
+	s.mu.RUnlock()
+	return s.deliver(message, lane, msgTag, topic)
+}
+
 // notify records the arrival, advances delivery state, arms liveness, and invokes
 // the delivery callback. Returns false if the subscriber was disposed.
 func (s *Subscriber) notify(arrival *Arrival) bool {
