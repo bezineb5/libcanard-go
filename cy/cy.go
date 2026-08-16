@@ -5,9 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unsafe"
 
-	"github.com/opencyphal/cy-go/cavl"
 	"github.com/opencyphal/cy-go/olga"
 	"go.dw1.io/rapidhash"
 )
@@ -1252,11 +1250,3 @@ func (p *DefaultPlatform) SetNow(now Microsecond) {
 func (p *DefaultPlatform) IncrementNow(delta Microsecond) {
 	p.nowValue += delta
 }
-
-// Test that the package compiles
-var _ = cavl.New[string, int](func(a, b string) int { return 1 })
-var _ = olga.New()
-var _ = rapidhash.Hash([]byte("test"))
-
-// Ensure unsafe.Pointer is used (for the linter)
-var _ unsafe.Pointer
