@@ -94,7 +94,7 @@ func rtTX(self *Canard, _ any, deadline int64, ifaceIndex uint8, fd bool, extend
 	return true // Always accept.
 }
 
-var rtTXVTable = &VTable{Now: rtTXNow, TX: rtTX, Filter: nil}
+var rtTXVTable = NewPlatform(rtTXNow, rtTX, nil)
 
 // ------------------------------------------------  RX Capture  -------------------------------------------------------
 
@@ -131,7 +131,7 @@ func rtRXTX(_ *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool
 	return false // RX instance never transmits.
 }
 
-var rtRXVTable = &VTable{Now: rtRXNow, TX: rtRXTX, Filter: nil}
+var rtRXVTable = NewPlatform(rtRXNow, rtRXTX, nil)
 
 // ------------------------------------------------  Roundtrip Harness  ------------------------------------------------
 

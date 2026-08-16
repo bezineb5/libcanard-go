@@ -92,17 +92,9 @@ func captureFilter(self *Canard, filterCount int, _ []Filter) bool {
 	return true
 }
 
-var captureVTable = &VTable{
-	Now:    captureNow,
-	TX:     captureTX,
-	Filter: nil,
-}
+var captureVTable = NewPlatform(captureNow, captureTX, nil)
 
-var captureFilterVTable = &VTable{
-	Now:    captureNow,
-	TX:     captureTX,
-	Filter: captureFilter,
-}
+var captureFilterVTable = NewPlatform(captureNow, captureTX, captureFilter)
 
 // Minimal callbacks for New()/Init() validity tests.
 func mockNow(_ *Canard) int64 { return 0 }
@@ -111,20 +103,12 @@ func mockTX(_ *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool
 
 func mockFilterCB(_ *Canard, _ int, _ []Filter) bool { return true }
 
-var testVTable = &VTable{
-	Now:    mockNow,
-	TX:     mockTX,
-	Filter: nil,
-}
+var testVTable = NewPlatform(mockNow, mockTX, nil)
 
-var vtableWithFilter = &VTable{
-	Now:    mockNow,
-	TX:     mockTX,
-	Filter: mockFilterCB,
-}
+var vtableWithFilter = NewPlatform(mockNow, mockTX, mockFilterCB)
 
 // initCapture mirrors the C++ init_capture: a fresh instance wired to a txCapture, with the given node-ID.
-func initCapture(t *testing.T, self *Canard, cap *txCapture, nodeID uint8, queueCapacity int, filterCount int, vtable *VTable) {
+func initCapture(t *testing.T, self *Canard, cap *txCapture, nodeID uint8, queueCapacity int, filterCount int, vtable VTable) {
 	cap.reset()
 	if !self.Init(vtable, NewDefaultMemSet(), IfaceBitmapAll, queueCapacity, 1234, filterCount) {
 		t.Fatal("Init failed")
@@ -244,13 +228,13 @@ func TestCanardNewInvalidParams(t *testing.T) {
 	}
 
 	// Null vtable->now.
-	badNow := &VTable{Now: nil, TX: mockTX, Filter: nil}
+	badNow := NewPlatform(nil, mockTX, nil)
 	if c, ok := New(badNow, mem, IfaceBitmapAll, 16, 0, 0); ok || c != nil {
 		t.Error("New with nil Now should fail")
 	}
 
 	// Null vtable->tx.
-	badTX := &VTable{Now: mockNow, TX: nil, Filter: nil}
+	badTX := NewPlatform(mockNow, nil, nil)
 	if c, ok := New(badTX, mem, IfaceBitmapAll, 16, 0, 0); ok || c != nil {
 		t.Error("New with nil TX should fail")
 	}
@@ -687,7 +671,7 @@ func TestErrTXCapacity(t *testing.T) {
 	self := &Canard{}
 	cap := &txCapture{}
 	initCapture(t, self, cap, 42, 1, 0, captureVTable) // queue_capacity=1
-	self.tx.FD = false                                      // Classic CAN
+	self.tx.FD = false                                 // Classic CAN
 
 	// 20-byte payload on Classic CAN needs at least 4 frames. Queue capacity is 1 -> tx_capacity error.
 	payload := make([]byte, 20)
@@ -1067,7 +1051,7 @@ func TestCanardNewValidationBranches(t *testing.T) {
 
 	// vtable->now == NULL.
 	{
-		bad := &VTable{Now: nil, TX: mockTX, Filter: nil}
+		bad := NewPlatform(nil, mockTX, nil)
 		if c, ok := New(bad, mem, IfaceBitmapAll, 16, 0, 0); ok || c != nil {
 			t.Error("New with nil Now should fail")
 		}
@@ -1075,7 +1059,7 @@ func TestCanardNewValidationBranches(t *testing.T) {
 
 	// vtable->tx == NULL.
 	{
-		bad := &VTable{Now: mockNow, TX: nil, Filter: nil}
+		bad := NewPlatform(mockNow, nil, nil)
 		if c, ok := New(bad, mem, IfaceBitmapAll, 16, 0, 0); ok || c != nil {
 			t.Error("New with nil TX should fail")
 		}

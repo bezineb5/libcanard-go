@@ -28,7 +28,15 @@ func New(platform Platform, memory MemSet, ifaceBitmap uint8, txQueueCapacity in
 func (self *Canard) Init(platform Platform, memory MemSet, ifaceBitmap uint8, txQueueCapacity int, prngSeed uint64, filterCount int) bool {
 	filterOK := (filterCount == 0) || memValid(memory.RXFilters)
 	ifaceOK := (ifaceBitmap & IfaceBitmapAll) == ifaceBitmap
-	ok := self != nil && platform != nil &&
+	// A Go interface value cannot be introspected for nil methods, so we validate the concrete
+	// *platformImpl produced by NewPlatform; custom Platform implementations are accepted as-is
+	// (their correctness is the caller's contract). This restores the C behaviour of rejecting an
+	// incomplete vtable.
+	platformOK := platform != nil
+	if p, ok := platform.(*platformImpl); ok {
+		platformOK = p.now != nil && p.tx != nil && (filterCount == 0 || p.filter != nil)
+	}
+	ok := self != nil && platformOK &&
 		memValid(memory.TXTransfer) && memValid(memory.TXFrame) && memValid(memory.RXSession) && memValid(memory.RXPayload) &&
 		filterOK && ifaceOK
 	if ok {

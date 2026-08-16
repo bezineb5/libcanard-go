@@ -75,11 +75,7 @@ func txQueueCaptureTX(self *Canard, _ any, deadline int64, ifaceIndex uint8, fd 
 	return cap.acceptTX
 }
 
-var txQueueCaptureVTable = &VTable{
-	Now:    txQueueCaptureNow,
-	TX:     txQueueCaptureTX,
-	Filter: nil,
-}
+var txQueueCaptureVTable = NewPlatform(txQueueCaptureNow, txQueueCaptureTX, nil,)
 
 // =====================================================================================================================
 //                                         Initialization Helpers

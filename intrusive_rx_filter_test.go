@@ -80,13 +80,13 @@ func makeCaptureInstance(nodeID uint8, filterCount int) (*Canard, *captureFixtur
 	fx := &captureFixture{}
 	now := int64(0)
 	c := &Canard{}
-	ok := c.Init(&VTable{
-		Now: func(self *Canard) int64 { return now },
-		TX: func(self *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool {
+	ok := c.Init(NewPlatform(
+		func(self *Canard) int64 { return now },
+		func(self *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool {
 			return true
 		},
-		Filter: fx.callback,
-	}, NewDefaultMemSet(), IfaceBitmapAll, 16, 1234, filterCount)
+		fx.callback,
+	), NewDefaultMemSet(), IfaceBitmapAll, 16, 1234, filterCount)
 	if !ok {
 		panic("init failed")
 	}
@@ -345,7 +345,7 @@ func TestRxFilterCoalesceIntoSelectsBestRank(t *testing.T) {
 	fusedIndex1 := rxFilterFuse(into[1], nf)
 	rxFilterCoalesceInto(2, into[:], nf)
 	assertCANID(t, "into[0]", into[0].ExtendedCANID, 0x0) // unchanged
-	assertMask(t, "into[0]", into[0].ExtendedMask, 0xF)    // unchanged
+	assertMask(t, "into[0]", into[0].ExtendedMask, 0xF)   // unchanged
 	assertFilterEq(t, "into[1]", into[1], fusedIndex1)
 }
 

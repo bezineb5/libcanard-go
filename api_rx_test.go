@@ -118,7 +118,7 @@ func rxTestMockTX(_ *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte
 	return false
 }
 
-var rxTestVTable = &VTable{Now: rxTestMockNow, TX: rxTestMockTX, Filter: nil}
+var rxTestVTable = NewPlatform(rxTestMockNow, rxTestMockTX, nil)
 
 // initRxTestCanard initializes a Canard instance for RX testing with a controllable clock.
 func initRxTestCanard(self *Canard, nowVal *int64, nodeID uint8) {

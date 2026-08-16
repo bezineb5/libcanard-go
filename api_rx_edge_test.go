@@ -85,7 +85,7 @@ func rxEdgeMockTX(_ *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte
 	return false
 }
 
-var rxEdgeTestVTable = &VTable{Now: rxEdgeMockNow, TX: rxEdgeMockTX, Filter: nil}
+var rxEdgeTestVTable = NewPlatform(rxEdgeMockNow, rxEdgeMockTX, nil)
 
 // initRxEdgeCanard initializes a Canard instance for RX edge testing with a controllable clock.
 func initRxEdgeCanard(self *Canard, nowVal *int64, nodeID uint8) {

@@ -89,10 +89,11 @@ func fatalSeedNotFound(t *testing.T, seed uint64) {
 // flags and queue capacity.
 func makeTXCanard(nodeID uint8, prngSeed uint64) *Canard {
 	self := &Canard{}
-	self.VTable = &VTable{
-		Now: func(self *Canard) int64 { return 0 },
-		TX:  func(self *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool { return false },
-	}
+	self.Platform = NewPlatform(
+		func(self *Canard) int64 { return 0 },
+		func(self *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool { return false },
+		nil,
+	)
 	self.IfaceBitmap = IfaceBitmapAll
 	self.Mem = NewDefaultMemSet()
 	self.tx.queueCapacity = 64

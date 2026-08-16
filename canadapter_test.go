@@ -58,11 +58,7 @@ func adapterInstance(t *testing.T, nodeID uint8, tx func(*Canard, any, int64, ui
 	t.Helper()
 	now := int64(0)
 	c := &Canard{}
-	ok := c.Init(&VTable{
-		Now:    func(self *Canard) int64 { return now },
-		TX:     tx,
-		Filter: FilterAcceptAll,
-	}, NewDefaultMemSet(), IfaceBitmapAll, 1000, 12345, 0)
+	ok := c.Init(NewPlatform(func(self *Canard) int64 { return now }, tx, FilterAcceptAll,), NewDefaultMemSet(), IfaceBitmapAll, 1000, 12345, 0)
 	if !ok {
 		t.Fatal("init failed")
 	}

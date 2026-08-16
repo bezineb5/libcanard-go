@@ -70,11 +70,7 @@ func txTestCaptureTX(self *Canard, _ any, deadline int64, ifaceIndex uint8, fd b
 	return cap.acceptTX
 }
 
-var txTestCaptureVTable = &VTable{
-	Now:    txTestCaptureNow,
-	TX:     txTestCaptureTX,
-	Filter: nil,
-}
+var txTestCaptureVTable = NewPlatform(txTestCaptureNow, txTestCaptureTX, nil)
 
 // =====================================================================================================================
 //                                         Mock VTable
@@ -86,11 +82,7 @@ func txTestMockNow(_ *Canard) int64 { return 0 }
 // txTestMockTX always returns false.
 func txTestMockTX(_ *Canard, _ any, _ int64, _ uint8, _ bool, _ uint32, _ []byte) bool { return false }
 
-var txTestVTable = &VTable{
-	Now:    txTestMockNow,
-	TX:     txTestMockTX,
-	Filter: nil,
-}
+var txTestVTable = NewPlatform(txTestMockNow, txTestMockTX, nil)
 
 // initTxAPITestCanard initializes a Canard instance for TX API testing with a capture.
 func initTxAPITestCanard(self *Canard, cap *txTestCapture) {
@@ -381,7 +373,7 @@ func TestCanardPublishOOM(t *testing.T) {
 		t.Fatal("Init with invalid memory should fail")
 	}
 
-	// Without successful Init, self.VTable is nil, so any publish would panic.
+	// Without successful Init, self.Platform is nil, so any publish would panic.
 	// This is expected behavior - the instance must be initialized before use.
 	// We verify that Init correctly rejected the invalid memory configuration.
 }

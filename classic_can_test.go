@@ -5,10 +5,13 @@ import "testing"
 // TestSetClassicCAN verifies that the exported Classic CAN switch flips tx.FD (the MTU selector)
 // and that the default remains CAN FD, matching the C library's default behaviour.
 func TestSetClassicCAN(t *testing.T) {
-	inst, ok := New(&VTable{
-		Now: func(self *Canard) int64 { return 0 },
-		TX:  func(self *Canard, uc any, dl int64, idx uint8, fd bool, id uint32, data []byte) bool { return true },
-	}, NewDefaultMemSet(), IfaceBitmapAll, 16, 0, 0)
+	inst, ok := New(
+		NewPlatform(
+			func(self *Canard) int64 { return 0 },
+			func(self *Canard, uc any, dl int64, idx uint8, fd bool, id uint32, data []byte) bool { return true },
+			nil,
+		),
+		NewDefaultMemSet(), IfaceBitmapAll, 16, 0, 0)
 	if !ok {
 		t.Fatal("New returned false")
 	}

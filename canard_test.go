@@ -58,21 +58,14 @@ type recordedFrame struct {
 	data []byte
 }
 
-func makeInstance(nodeID uint8) *Canard {
+func makeInstance(nodeID uint8, tx func(self *Canard, ctx any, deadline int64, iface uint8, fd bool, id uint32, data []byte) bool) *Canard {
 	now := int64(0)
 	c := &Canard{}
-	ok := c.Init(&VTable{
-		Now: func(self *Canard) int64 { return now },
-		TX: func(self *Canard, ctx any, deadline int64, iface uint8, fd bool, id uint32, data []byte) bool {
-			r := ctx.(*recorderTX)
-			buf := make([]byte, len(data))
-			copy(buf, data)
-			r.frames = append(r.frames, recordedFrame{id: id, data: buf})
-			now += 1
-			return true
-		},
-		Filter: func(self *Canard, count int, filters []Filter) bool { return true },
-	}, NewDefaultMemSet(), IfaceBitmapAll, 1000, 12345, 0)
+	ok := c.Init(NewPlatform(
+		func(self *Canard) int64 { return now },
+		tx,
+		func(self *Canard, count int, filters []Filter) bool { return true },
+	), NewDefaultMemSet(), IfaceBitmapAll, 1000, 12345, 0)
 	if !ok {
 		panic("init failed")
 	}
@@ -81,15 +74,14 @@ func makeInstance(nodeID uint8) *Canard {
 }
 
 func TestRoundTripSingleFrame(t *testing.T) {
-	sender := makeInstance(42)
-	receiver := makeInstance(43)
 	rec := &recorderTX{}
-	sender.VTable.TX = func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool {
+	sender := makeInstance(42, func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool {
 		buf := make([]byte, len(data))
 		copy(buf, data)
 		rec.frames = append(rec.frames, recordedFrame{id: id, data: buf})
 		return true
-	}
+	})
+	receiver := makeInstance(43, func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool { return true })
 
 	var got []byte
 	sub := &Subscription{}
@@ -121,17 +113,15 @@ func TestRoundTripSingleFrame(t *testing.T) {
 }
 
 func TestRoundTripMultiFrameClassic(t *testing.T) {
-	sender := makeInstance(42)
-	sender.tx.FD = false // force Classic CAN -> multi-frame
-	receiver := makeInstance(43)
-
 	rec := &recorderTX{}
-	sender.VTable.TX = func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool {
+	sender := makeInstance(42, func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool {
 		buf := make([]byte, len(data))
 		copy(buf, data)
 		rec.frames = append(rec.frames, recordedFrame{id: id, data: buf})
 		return true
-	}
+	})
+	sender.tx.FD = false // force Classic CAN -> multi-frame
+	receiver := makeInstance(43, func(self *Canard, ctx any, dl int64, iface uint8, fd bool, id uint32, data []byte) bool { return true })
 
 	var got []byte
 	sub := &Subscription{}
