@@ -106,7 +106,7 @@ type readerCtx struct {
 }
 
 // New creates a new CAN platform bound to the named SocketCAN interface.
-func New(ifaceName string, txQueueCapacity, filterCount int, prngSeed uint64) (*Platform, error) {
+func New(ifaceName string, txQueueCapacity, filterCount int, prngSeed uint64) (cy.Platform, error) {
 	if ifaceName == "" {
 		return nil, errors.New("CAN interface name is required")
 	}
@@ -417,7 +417,7 @@ func buildPhonyHeader(out *[headerBytes]byte, sid uint32) {
 	out[6] = byte(ev >> 16)
 	out[7] = byte(ev >> 24)
 	h := compatTopicHash(sid)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		out[8+i] = byte(h >> (8 * uint(i)))
 	}
 }
@@ -631,12 +631,11 @@ func copyPayloadInto(payload *libcanard.Payload, dst []byte) {
 }
 
 func binaryLEPutUint64(buf []byte, v uint64) {
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		buf[i] = byte(v >> (8 * uint(i)))
 	}
 }
 
-// Ensure interfaces are satisfied.
-var _ cy.Platform = (*Platform)(nil)
+// Ensure subject writer/reader types satisfy the cy interfaces.
 var _ cy.SubjectWriter = (*subjectWriter)(nil)
 var _ cy.SubjectReader = (*subjectReader)(nil)

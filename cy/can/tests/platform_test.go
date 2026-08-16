@@ -3,8 +3,12 @@ package tests
 import (
 	"testing"
 
+	"github.com/opencyphal/cy-go"
 	"github.com/opencyphal/cy-go/can"
 )
+
+// asCAN resolves the concrete CAN platform from the cy.Platform returned by can.New.
+func asCAN(p cy.Platform) *can.Platform { return p.(*can.Platform) }
 
 // TestNew tests the New function with various inputs.
 func TestNew(t *testing.T) {
@@ -51,7 +55,7 @@ func TestNew(t *testing.T) {
 					// If we expected an error but didn't get one, check if it's because
 					// the interface doesn't exist (which is also an error)
 					if platform != nil {
-						platform.Destroy()
+						asCAN(platform).Destroy()
 						t.Error("Expected error, got nil")
 					}
 				}
@@ -71,7 +75,7 @@ func TestNew(t *testing.T) {
 			}
 			
 			// Clean up
-			platform.Destroy()
+			asCAN(platform).Destroy()
 		})
 	}
 }
@@ -84,7 +88,7 @@ func TestNewSubjectWriter(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create a subject writer
 	writer, err := platform.NewSubjectWriter(123)
@@ -111,7 +115,7 @@ func TestDestroySubjectWriter(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create and destroy a subject writer
 	writer, err := platform.NewSubjectWriter(123)
@@ -133,7 +137,7 @@ func TestNewSubjectReader(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create a subject reader
 	reader, err := platform.NewSubjectReader(123, 256)
@@ -164,7 +168,7 @@ func TestSetSubjectReaderExtent(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create a subject reader
 	reader, err := platform.NewSubjectReader(123, 256)
@@ -188,7 +192,7 @@ func TestNow(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Get current time
 	now := platform.Now()
@@ -207,7 +211,7 @@ func TestRandom(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Get random value
 	rand1 := platform.Random()
@@ -227,7 +231,7 @@ func TestRealloc(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Allocate some memory
 	ptr1 := platform.Realloc(nil, 100)
@@ -259,10 +263,10 @@ func TestDestroy(t *testing.T) {
 	}
 
 	// Destroy should not panic
-	platform.Destroy()
+	asCAN(platform).Destroy()
 	
 	// Destroy again should not panic
-	platform.Destroy()
+	asCAN(platform).Destroy()
 }
 
 // TestMultipleWriters tests creating multiple writers.
@@ -273,7 +277,7 @@ func TestMultipleWriters(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create multiple writers
 	writers := make([]interface{}, 10)
@@ -299,7 +303,7 @@ func TestMultipleReaders(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Create multiple readers
 	readers := make([]interface{}, 10)
@@ -325,7 +329,7 @@ func TestSpin(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// Spin should not panic or block indefinitely
 	err = platform.Spin(platform.Now() + 1000) // Spin for 1ms
@@ -342,7 +346,7 @@ func TestSetCy(t *testing.T) {
 		t.Skip("CAN interface not available, skipping test")
 		return
 	}
-	defer platform.Destroy()
+	defer asCAN(platform).Destroy()
 
 	// SetCy should not panic with nil
 	platform.SetCy(nil)
